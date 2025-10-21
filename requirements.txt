@@ -1,5 +1,5 @@
-fastapi
-uvicorn[standard]
-SQLAlchemy>=2.0
-pymysql
-python-dotenv
+fastapi==0.110.0
+uvicorn[standard]==0.24.0.post1
+SQLAlchemy==2.0.23
+pymysql==1.1.0
+python-dotenv==1.0.1
