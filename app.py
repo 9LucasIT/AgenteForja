@@ -1,23 +1,31 @@
-import os, json, re
-from datetime import datetime, timedelta
+import os, json, re, time
+from datetime import datetime
 from typing import Optional
 from fastapi import FastAPI
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-# === Config ===
-# Railway: set DATABASE_URL to ${{ MySQL.MYSQL_URL }} in the service Variables.
-DATABASE_URL = os.getenv("DATABASE_URL")  # e.g., mysql+pymysql://user:pass@host:port/db
-if not DATABASE_URL:
-    raise RuntimeError("Missing DATABASE_URL env var. In Railway set DATABASE_URL=${{ MySQL.MYSQL_URL }}")
-
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-
 app = FastAPI(title="Real Estate Lead Qualifier")
 
-# === Bootstrap DB: create tables and seed demo properties ===
+# === CONFIG ===
+raw_url = os.getenv("DATABASE_URL", "")
+if not raw_url:
+    raise RuntimeError("Missing DATABASE_URL. In Railway set DATABASE_URL=${{ MySQL.MYSQL_URL }}")
+
+# Railway entrega "mysql://..." → necesitamos "mysql+pymysql://..."
+if raw_url.startswith("mysql://"):
+    raw_url = "mysql+pymysql://" + raw_url[len("mysql://"):]
+
+# Conexión robusta para evitar caídas
+engine = create_engine(
+    raw_url,
+    pool_pre_ping=True,   # verifica conexión antes de usarla
+    pool_recycle=180,     # evita "MySQL server has gone away"
+)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+# === Bootstrap DB ===
 BOOTSTRAP_SQL = """
 CREATE TABLE IF NOT EXISTS chat_session (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -69,7 +77,7 @@ VALUES
 ON DUPLICATE KEY UPDATE direccion=VALUES(direccion);
 """
 
-def bootstrap():
+def do_bootstrap():
     with engine.begin() as conn:
         for stmt in BOOTSTRAP_SQL.strip().split(";\n\n"):
             s = stmt.strip()
@@ -79,9 +87,21 @@ def bootstrap():
         if cnt == 0:
             conn.execute(text(SEED_SQL))
 
-bootstrap()
+# Bootstrap con reintentos (la DB puede demorar)
+@app.on_event("startup")
+def startup():
+    for attempt in range(1, 8):
+        try:
+            do_bootstrap()
+            print("✅ Database bootstrap done")
+            return
+        except Exception as e:
+            print(f"⚠️ Bootstrap error (attempt {attempt}):", e)
+            if attempt == 7:
+                raise
+            time.sleep(2 * attempt)
 
-# === Models ===
+# === MODELOS ===
 class MsgIn(BaseModel):
     message_id: str
     user_phone: str
@@ -93,9 +113,9 @@ class MsgOut(BaseModel):
     vendor_push: bool = False
     updates: dict = {}
 
-# === Simple dialog policy ===
-GREETING = re.compile(r"\b(hola|buenas|hey)\b", re.I)
-MONEY = re.compile(r"(\d[\d\.]{3,})")  # numbers like 120000 or 120.000
+# === LÓGICA DEL AGENTE ===
+GREETING = re.compile(r"\\b(hola|buenas|hey)\\b", re.I)
+MONEY = re.compile(r"(\\d[\\d\\.]{3,})")
 ORDER = ["inmueble_interes","dormitorios","presupuesto","ventana_tiempo","contacto"]
 
 def extract_signals(text_in: str):
@@ -130,7 +150,6 @@ def healthz():
 def qualify(msg: MsgIn):
     db = SessionLocal()
     try:
-        # upsert session
         s = db.execute(
             text("SELECT * FROM chat_session WHERE user_phone=:p"),
             {"p": msg.user_phone}
@@ -152,28 +171,25 @@ def qualify(msg: MsgIn):
         if "presupuesto_min" in sig and not slots.get("presupuesto"):
             slots["presupuesto"] = f"{sig['presupuesto_min']}+"
 
-        # naive property detection and suggestions
         sugerencia_txt = ""
         lower = txt.lower()
         looks_like_property = any(w in lower for w in ["calle","av.","avenida","zona","barrio","pellegrini","san luis","centro"])
         if looks_like_property:
             res = db.execute(
-                text("""SELECT direccion, zona, precio, dormitorios, cochera
+                text(\"\"\"SELECT direccion, zona, precio, dormitorios, cochera
                         FROM propiedades
                         WHERE zona LIKE :q OR direccion LIKE :q
-                        ORDER BY precio ASC LIMIT 3"""),
-                {"q": f"%{txt}%"}
+                        ORDER BY precio ASC LIMIT 3\"\"\"), {"q": f"%{txt}%"}
             ).mappings().all()
             if res:
                 slots["inmueble_interes"] = res[0]["direccion"]
                 sug = []
                 for r in res:
                     sug.append(f"• {r['direccion']} ({r['zona']}) — {r['dormitorios']} dorm, {'cochera' if r['cochera'] else 'sin cochera'}, ${r['precio']:,}".replace(",", "."))
-                sugerencia_txt = "Mirá, tengo estas que encajan:\n" + "\n".join(sug)
+                sugerencia_txt = "Mirá, tengo estas que encajan:\\n" + "\\n".join(sug)
 
         missing = next_missing(slots)
         if not missing:
-            # mark qualified
             db.execute(
                 text("INSERT INTO leads (user_phone, status) VALUES (:p, 'calificado') ON DUPLICATE KEY UPDATE status='calificado', updated_at=NOW()"),
                 {"p": msg.user_phone}
@@ -184,33 +200,21 @@ def qualify(msg: MsgIn):
             )
             db.commit()
             return MsgOut(
-                text=(sugerencia_txt + "\n" if sugerencia_txt else "") + "¡Perfecto! Con eso ya tengo todo. Le paso tu consulta a la vendedora y te escribe en breve.",
+                text=(sugerencia_txt + "\\n" if sugerencia_txt else "") + "¡Perfecto! Con eso ya tengo todo. Le paso tu consulta a la vendedora y te escribe en breve.",
                 vendor_push=True,
-                updates={"status":"calificado","slots":slots}
+                updates={"status": "calificado", "slots": slots}
             )
 
-        # not yet qualified → ask next
         question = build_question(missing)
-        body = (sugerencia_txt + "\n" if sugerencia_txt else "") + "Genial, te ayudo con eso."
-        # upsert partial lead
+        body = (sugerencia_txt + "\\n" if sugerencia_txt else "") + "Genial, te ayudo con eso."
+
         db.execute(
-            text("""
-            INSERT INTO leads (user_phone, inmueble_interes, presupuesto_min)
+            text(\"\"\"INSERT INTO leads (user_phone, inmueble_interes, presupuesto_min)
             VALUES (:p, :ii, :pm)
-            ON DUPLICUTE KEY UPDATE
+            ON DUPLICATE KEY UPDATE
               inmueble_interes=COALESCE(:ii, inmueble_interes),
               presupuesto_min=COALESCE(:pm, presupuesto_min),
-              updated_at=NOW()
-            """),
-            {"p": msg.user_phone, "ii": slots.get("inmueble_interes"), "pm": sig.get("presupuesto_min")}
-        )
-        # fix typo in ON DUPLICATE
-        db.execute(
-            text("""
-            INSERT INTO leads (user_phone) VALUES (:p)
-            ON DUPLICATE KEY UPDATE updated_at=NOW()
-            """),
-            {"p": msg.user_phone}
+              updated_at=NOW()\"\"\"), {"p": msg.user_phone, "ii": slots.get("inmueble_interes"), "pm": sig.get("presupuesto_min")}
         )
         db.execute(
             text("UPDATE chat_session SET slots_json=:sj, last_message_id=:mid, updated_at=NOW() WHERE user_phone=:p"),
@@ -220,3 +224,4 @@ def qualify(msg: MsgIn):
         return MsgOut(text=body, next_question=question, vendor_push=False, updates={"slots": slots})
     finally:
         db.close()
+
