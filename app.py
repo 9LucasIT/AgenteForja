@@ -96,7 +96,7 @@ def startup():
             print("✅ Database bootstrap done")
             return
         except Exception as e:
-            print(f"⚠️ Bootstrap error (attempt {attempt}):", e)
+            print(f"⚠️ Bootstrap error (attempt {attempt}): {e}")
             if attempt == 7:
                 raise
             time.sleep(2 * attempt)
@@ -114,8 +114,8 @@ class MsgOut(BaseModel):
     updates: dict = {}
 
 # === LÓGICA DEL AGENTE ===
-GREETING = re.compile(r"\\b(hola|buenas|hey)\\b", re.I)
-MONEY = re.compile(r"(\\d[\\d\\.]{3,})")
+GREETING = re.compile(r"\b(hola|buenas|hey)\b", re.I)
+MONEY = re.compile(r"(\d[\d\.]{3,})")
 ORDER = ["inmueble_interes","dormitorios","presupuesto","ventana_tiempo","contacto"]
 
 def extract_signals(text_in: str):
@@ -176,17 +176,22 @@ def qualify(msg: MsgIn):
         looks_like_property = any(w in lower for w in ["calle","av.","avenida","zona","barrio","pellegrini","san luis","centro"])
         if looks_like_property:
             res = db.execute(
-                text(\"\"\"SELECT direccion, zona, precio, dormitorios, cochera
-                        FROM propiedades
-                        WHERE zona LIKE :q OR direccion LIKE :q
-                        ORDER BY precio ASC LIMIT 3\"\"\"), {"q": f"%{txt}%"}
+                text(
+                    """
+                    SELECT direccion, zona, precio, dormitorios, cochera
+                    FROM propiedades
+                    WHERE zona LIKE :q OR direccion LIKE :q
+                    ORDER BY precio ASC LIMIT 3
+                    """
+                ),
+                {"q": f"%{txt}%"}
             ).mappings().all()
             if res:
                 slots["inmueble_interes"] = res[0]["direccion"]
                 sug = []
                 for r in res:
                     sug.append(f"• {r['direccion']} ({r['zona']}) — {r['dormitorios']} dorm, {'cochera' if r['cochera'] else 'sin cochera'}, ${r['precio']:,}".replace(",", "."))
-                sugerencia_txt = "Mirá, tengo estas que encajan:\\n" + "\\n".join(sug)
+                sugerencia_txt = "Mirá, tengo estas que encajan:\n" + "\n".join(sug)
 
         missing = next_missing(slots)
         if not missing:
@@ -200,21 +205,26 @@ def qualify(msg: MsgIn):
             )
             db.commit()
             return MsgOut(
-                text=(sugerencia_txt + "\\n" if sugerencia_txt else "") + "¡Perfecto! Con eso ya tengo todo. Le paso tu consulta a la vendedora y te escribe en breve.",
+                text=(sugerencia_txt + "\n" if sugerencia_txt else "") + "¡Perfecto! Con eso ya tengo todo. Le paso tu consulta a la vendedora y te escribe en breve.",
                 vendor_push=True,
                 updates={"status": "calificado", "slots": slots}
             )
 
         question = build_question(missing)
-        body = (sugerencia_txt + "\\n" if sugerencia_txt else "") + "Genial, te ayudo con eso."
+        body = (sugerencia_txt + "\n" if sugerencia_txt else "") + "Genial, te ayudo con eso."
 
         db.execute(
-            text(\"\"\"INSERT INTO leads (user_phone, inmueble_interes, presupuesto_min)
-            VALUES (:p, :ii, :pm)
-            ON DUPLICATE KEY UPDATE
-              inmueble_interes=COALESCE(:ii, inmueble_interes),
-              presupuesto_min=COALESCE(:pm, presupuesto_min),
-              updated_at=NOW()\"\"\"), {"p": msg.user_phone, "ii": slots.get("inmueble_interes"), "pm": sig.get("presupuesto_min")}
+            text(
+                """
+                INSERT INTO leads (user_phone, inmueble_interes, presupuesto_min)
+                VALUES (:p, :ii, :pm)
+                ON DUPLICATE KEY UPDATE
+                  inmueble_interes=COALESCE(:ii, inmueble_interes),
+                  presupuesto_min=COALESCE(:pm, presupuesto_min),
+                  updated_at=NOW()
+                """
+            ),
+            {"p": msg.user_phone, "ii": slots.get("inmueble_interes"), "pm": sig.get("presupuesto_min")}
         )
         db.execute(
             text("UPDATE chat_session SET slots_json=:sj, last_message_id=:mid, updated_at=NOW() WHERE user_phone=:p"),
@@ -224,4 +234,3 @@ def qualify(msg: MsgIn):
         return MsgOut(text=body, next_question=question, vendor_push=False, updates={"slots": slots})
     finally:
         db.close()
-
