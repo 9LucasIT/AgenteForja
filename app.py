@@ -159,6 +159,7 @@ def healthz():
 def qualify(msg: MsgIn):
     db = SessionLocal()
     try:
+        # upsert session
         s = db.execute(
             text("SELECT * FROM chat_session WHERE user_phone=:p"),
             {"p": msg.user_phone}
@@ -174,12 +175,19 @@ def qualify(msg: MsgIn):
         if s.get("last_message_id") == msg.message_id:
             return MsgOut(text="(ya procesado)")
 
-        slots = s.get("slots_json") or {}
+        # ✅ FIX: normalizar slots_json (puede venir como string desde MySQL)
+        slots_raw = s.get("slots_json")
+        if isinstance(slots_raw, dict):
+            slots = slots_raw
+        else:
+            slots = json.loads(slots_raw) if slots_raw else {}
+
         txt = msg.text.strip()
         sig = extract_signals(txt)
         if "presupuesto_min" in sig and not slots.get("presupuesto"):
             slots["presupuesto"] = f"{sig['presupuesto_min']}+"
 
+        # sugerencias por zona/dirección
         sugerencia_txt = ""
         lower = txt.lower()
         looks_like_property = any(w in lower for w in ["calle","av.","avenida","zona","barrio","pellegrini","san luis","centro"])
