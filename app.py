@@ -6,9 +6,10 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+# === INICIALIZACIÓN ===
 app = FastAPI(title="Real Estate Lead Qualifier")
 
-# === CONFIG ===
+# === CONFIGURACIÓN DE BASE DE DATOS ===
 raw_url = os.getenv("DATABASE_URL", "")
 if not raw_url:
     raise RuntimeError("Missing DATABASE_URL. In Railway set DATABASE_URL=${{ MySQL.MYSQL_URL }}")
@@ -25,7 +26,7 @@ engine = create_engine(
 )
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-# === Bootstrap DB ===
+# === CREACIÓN DE TABLAS ===
 BOOTSTRAP_SQL = """
 CREATE TABLE IF NOT EXISTS chat_session (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -87,7 +88,6 @@ def do_bootstrap():
         if cnt == 0:
             conn.execute(text(SEED_SQL))
 
-# Bootstrap con reintentos (la DB puede demorar)
 @app.on_event("startup")
 def startup():
     for attempt in range(1, 8):
@@ -141,6 +141,15 @@ def build_question(slot: str) -> str:
         "contacto": "¿Preferís que te contacten por acá o por llamada? ¿En qué horario?"
     }
     return preguntas[slot]
+
+# === ENDPOINTS ===
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "fastapi-agent",
+        "endpoints": ["/healthz", "/qualify", "/docs"]
+    }
 
 @app.get("/healthz")
 def healthz():
