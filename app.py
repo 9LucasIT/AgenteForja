@@ -18,7 +18,7 @@ if not raw_url:
 if raw_url.startswith("mysql://"):
     raw_url = "mysql+pymysql://" + raw_url[len("mysql://"):]
 
-# Conexión robusta para evitar caídas
+# Conexión robusta
 engine = create_engine(
     raw_url,
     pool_pre_ping=True,   # verifica conexión antes de usarla
@@ -175,7 +175,7 @@ def qualify(msg: MsgIn):
         if s.get("last_message_id") == msg.message_id:
             return MsgOut(text="(ya procesado)")
 
-        # ✅ FIX: normalizar slots_json (puede venir como string desde MySQL)
+        # ✅ normalizar slots_json (MySQL JSON puede venir como string)
         slots_raw = s.get("slots_json")
         if isinstance(slots_raw, dict):
             slots = slots_raw
@@ -184,6 +184,17 @@ def qualify(msg: MsgIn):
 
         txt = msg.text.strip()
         sig = extract_signals(txt)
+
+        # 🧼 RESET por saludo: si arranca con "hola/buenas/hey", vaciar slots y reiniciar sesión
+        if GREETING.search(txt.lower()):
+            slots = {}
+            db.execute(
+                text("UPDATE chat_session SET slots_json=JSON_OBJECT(), last_message_id=:mid, updated_at=NOW() WHERE user_phone=:p"),
+                {"mid": msg.message_id, "p": msg.user_phone}
+            )
+            db.commit()
+
+        # si hay número detectado y no hay presupuesto cargado aún
         if "presupuesto_min" in sig and not slots.get("presupuesto"):
             slots["presupuesto"] = f"{sig['presupuesto_min']}+"
 
@@ -207,11 +218,15 @@ def qualify(msg: MsgIn):
                 slots["inmueble_interes"] = res[0]["direccion"]
                 sug = []
                 for r in res:
-                    sug.append(f"• {r['direccion']} ({r['zona']}) — {r['dormitorios']} dorm, {'cochera' if r['cochera'] else 'sin cochera'}, ${r['precio']:,}".replace(",", "."))
+                    sug.append(
+                        f"• {r['direccion']} ({r['zona']}) — {r['dormitorios']} dorm, "
+                        f"{'cochera' if r['cochera'] else 'sin cochera'}, ${r['precio']:,}".replace(",", ".")
+                    )
                 sugerencia_txt = "Mirá, tengo estas que encajan:\n" + "\n".join(sug)
 
         missing = next_missing(slots)
         if not missing:
+            # listo para pasar a vendedor
             db.execute(
                 text("INSERT INTO leads (user_phone, status) VALUES (:p, 'calificado') ON DUPLICATE KEY UPDATE status='calificado', updated_at=NOW()"),
                 {"p": msg.user_phone}
@@ -222,11 +237,13 @@ def qualify(msg: MsgIn):
             )
             db.commit()
             return MsgOut(
-                text=(sugerencia_txt + "\n" if sugerencia_txt else "") + "¡Perfecto! Con eso ya tengo todo. Le paso tu consulta a la vendedora y te escribe en breve.",
+                text=(sugerencia_txt + "\n" if sugerencia_txt else "") +
+                     "¡Perfecto! Con eso ya tengo todo. Le paso tu consulta a la vendedora y te escribe en breve.",
                 vendor_push=True,
                 updates={"status": "calificado", "slots": slots}
             )
 
+        # falta info → seguimos preguntando
         question = build_question(missing)
         body = (sugerencia_txt + "\n" if sugerencia_txt else "") + "Genial, te ayudo con eso."
 
