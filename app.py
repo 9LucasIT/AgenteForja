@@ -2,323 +2,414 @@ import os
 import json
 import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 
-# =========================
-# Config & Conexión a MySQL
-# =========================
-
+# ====== ENV ======
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL env var is required")
+    raise RuntimeError("DATABASE_URL no está configurada.")
 
-# Forzar charset y un pool sano para Railway
-if "?" in DATABASE_URL:
-    DATABASE_URL += "&charset=utf8mb4"
-else:
-    DATABASE_URL += "?charset=utf8mb4"
+# Acepta tanto mysql:// como mysql+pymysql://; forzamos el driver pymysql
+if DATABASE_URL.startswith("mysql://"):
+    DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
 
-engine = create_engine(
+# ====== DB ENGINE ======
+engine: Engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,   # reconecta si el pool queda “muerto”
-    pool_recycle=300,     # recicla conexiones inactivas (Railway)
-    echo=False,
-    future=True,
+    pool_pre_ping=True,
+    pool_recycle=300,
+    isolation_level="AUTOCOMMIT",
 )
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")  # opcional
-VENDOR_PHONE = os.getenv("VENDOR_PHONE", "")  # se usa en n8n (mensaje al vendedor)
+# ====== OPENAI ======
+from openai import OpenAI
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY no está configurada.")
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ==============
-# FastAPI & I/O
-# ==============
+# ====== FASTAPI ======
+app = FastAPI(title="RealEstate AI Agent", version="1.0.0")
 
-app = FastAPI(title="Real-Estate Qualifier API")
 
+# ---------- Utils ----------
+def normalize_phone(p: str) -> str:
+    digits = re.sub(r"\D", "", str(p))
+    return digits
+
+def to_ars_number(txt: Optional[str]) -> Optional[int]:
+    if not txt:
+        return None
+    t = str(txt).lower()
+    t = t.replace("ars", "").replace("$", "").replace(" ", "")
+    t = t.replace(".", "").replace(",", "")
+    # 80k / 80K
+    if re.search(r"\d+k$", t):
+        base = re.sub(r"[^\d]", "", t[:-1]) or "0"
+        return int(base) * 1000
+    # 120mil, 120k
+    if "mil" in t:
+        base = re.sub(r"[^\d]", "", t) or "0"
+        return int(base) * 1000
+    digits = re.sub(r"[^\d]", "", t)
+    return int(digits) if digits else None
+
+def safe_bool_yesno(v: Optional[str]) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in ("si", "sí", "true", "con", "yes", "y", "1"):
+        return "sí"
+    if s in ("no", "false", "sin", "n", "0"):
+        return "no"
+    return None
+
+
+# ---------- Prompts ----------
+AGENT_SYSTEM_PROMPT = """
+Sos una asesora inmobiliaria argentina, cálida y profesional. Tratá de “vos”.
+Tu objetivo es calificar al contacto con trato humano y natural.
+
+Slots a completar:
+- zona (barrio/dirección aproximada) → slots.zona
+- presupuesto_min (ARS) → slots.presupuesto_min
+- presupuesto_max (ARS) → slots.presupuesto_max
+- dormitorios (entero) → slots.dormitorios
+- cochera (sí/no) → slots.cochera
+
+Reglas:
+- UNA sola pregunta por mensaje.
+- Antes de preguntar, confirmá en 1 línea lo que entendiste (“Perfecto, zona Abasto. …”).
+- No repreguntes lo ya dicho; si dicen “ya te dije”, revisá lo que hay y seguí con lo que falte.
+- Si ya hay mínimo, pedí máximo; si hay máximo, pedí mínimo.
+- Aceptá formatos: 80k, 100.000, $120 mil → números.
+- Tono cercano/humano, sin listas, sin paréntesis, máx. 2 líneas.
+
+Cierre (vendor_push=true):
+- Cuando tengas: zona + presupuesto_min + presupuesto_max.
+- Si hay dormitorios/cochera, mejor; si no, igual podés cerrar.
+
+Devolvé SIEMPRE JSON:
+{
+  "text": "<mensaje de 1–2 líneas>",
+  "next_question": "<pregunta próxima o null>",
+  "vendor_push": <true|false>,
+  "updates": {
+    "slots": {
+      "zona": <string|null>,
+      "presupuesto_min": <number|string|null>,
+      "presupuesto_max": <number|string|null>,
+      "dormitorios": <number|string|null>,
+      "cochera": <"sí"|"no"|string|null>,
+      "conversation": <array de turnos {role, content}>
+    }
+  }
+}
+Nada fuera de ese JSON.
+"""
+
+FEWSHOT = [
+    {
+        "role": "user",
+        "content": "Hola"
+    },
+    {
+        "role": "assistant",
+        "content": '{"text":"¡Hola! ¿Cómo estás? Contame en qué zona te gustaría buscar.","next_question":"¿En qué zona o barrio te gustaría?","vendor_push":false,"updates":{"slots":{"zona":null,"presupuesto_min":null,"presupuesto_max":null,"dormitorios":null,"cochera":null,"conversation":[{"role":"user","content":"Hola"},{"role":"assistant","content":"¡Hola! ¿Cómo estás? Contame en qué zona te gustaría buscar."}]}}}'
+    },
+    {
+        "role": "user",
+        "content": "En Abasto"
+    },
+    {
+        "role": "assistant",
+        "content": '{"text":"Perfecto, zona Abasto. Para ubicarnos mejor necesito un rango de presupuesto.","next_question":"¿Cuál sería tu presupuesto mínimo aproximado (en ARS)?","vendor_push":false,"updates":{"slots":{"zona":"Abasto","presupuesto_min":null,"presupuesto_max":null,"dormitorios":null,"cochera":null,"conversation":[{"role":"user","content":"En Abasto"}]}}}'
+    },
+    {
+        "role": "user",
+        "content": "80k"
+    },
+    {
+        "role": "assistant",
+        "content": '{"text":"Genial, tomo $80.000 como mínimo. Para cerrar el rango necesito el máximo.","next_question":"¿Y el presupuesto máximo (en ARS)?","vendor_push":false,"updates":{"slots":{"zona":"Abasto","presupuesto_min":80000,"presupuesto_max":null,"dormitorios":null,"cochera":null,"conversation":[{"role":"user","content":"80k"}]}}}'
+    },
+    {
+        "role": "user",
+        "content": "100000"
+    },
+    {
+        "role": "assistant",
+        "content": '{"text":"Perfecto, rango $80.000–$100.000 en Abasto. Con eso ya puedo pasarte con el equipo.","next_question":null,"vendor_push":true,"updates":{"slots":{"zona":"Abasto","presupuesto_min":80000,"presupuesto_max":100000,"dormitorios":null,"cochera":null,"conversation":[{"role":"user","content":"100000"}]}}}'
+    }
+]
+
+
+# ---------- DB helpers ----------
+def db_fetchone(sql: str, params: dict) -> Optional[Dict[str, Any]]:
+    with engine.connect() as conn:
+        res = conn.execute(text(sql), params)
+        row = res.mappings().first()
+        return dict(row) if row else None
+
+def db_fetchall(sql: str, params: dict) -> List[Dict[str, Any]]:
+    with engine.connect() as conn:
+        res = conn.execute(text(sql), params)
+        rows = res.mappings().all()
+        return [dict(r) for r in rows]
+
+def db_execute(sql: str, params: dict) -> None:
+    with engine.connect() as conn:
+        conn.execute(text(sql), params)
+
+
+# ---------- Session & Leads ----------
+def get_or_create_session(user_phone: str) -> Dict[str, Any]:
+    s = db_fetchone(
+        "SELECT * FROM chat_session WHERE user_phone=:p LIMIT 1",
+        {"p": user_phone}
+    )
+    if s:
+        return s
+    slots = {}
+    db_execute(
+        """
+        INSERT INTO chat_session (user_phone, last_message_id, last_welcome_at, cooldown_until, status, slots_json, created_at, updated_at)
+        VALUES (:p, NULL, NULL, NULL, 'active', :slots, NOW(), NOW())
+        """,
+        {"p": user_phone, "slots": json.dumps(slots)},
+    )
+    return db_fetchone(
+        "SELECT * FROM chat_session WHERE user_phone=:p LIMIT 1",
+        {"p": user_phone}
+    )
+
+def update_session(user_phone: str, slots: Dict[str, Any]) -> None:
+    db_execute(
+        """
+        UPDATE chat_session
+        SET slots_json=:slots, updated_at=NOW()
+        WHERE user_phone=:p
+        """,
+        {"p": user_phone, "slots": json.dumps(slots)},
+    )
+
+def ensure_lead_row(user_phone: str, vendor_phone: str) -> None:
+    row = db_fetchone(
+        "SELECT id FROM leads WHERE user_phone=:p LIMIT 1",
+        {"p": user_phone}
+    )
+    if row:
+        return
+    db_execute(
+        """
+        INSERT INTO leads (user_phone, status, vendor_phone, created_at, updated_at)
+        VALUES (:p, 'pendiente', :v, NOW(), NOW())
+        """,
+        {"p": user_phone, "v": vendor_phone},
+    )
+
+def update_lead_from_slots(user_phone: str, slots: Dict[str, Any]) -> None:
+    # Campos compatibles con tu tabla leads
+    sql = """
+    UPDATE leads SET
+      inmueble_interes = COALESCE(:zona, inmueble_interes),
+      dormitorios = COALESCE(:dormitorios, dormitorios),
+      cochera = COALESCE(:cochera, cochera),
+      presupuesto_min = COALESCE(:pmin, presupuesto_min),
+      presupuesto_max = COALESCE(:pmax, presupuesto_max),
+      updated_at=NOW()
+    WHERE user_phone=:p
+    """
+    db_execute(sql, {
+        "zona": slots.get("zona"),
+        "dormitorios": slots.get("dormitorios"),
+        "cochera": slots.get("cochera"),
+        "pmin": slots.get("presupuesto_min"),
+        "pmax": slots.get("presupuesto_max"),
+        "p": user_phone
+    })
+
+
+# ---------- Matching de propiedades ----------
+def suggest_properties(slots: Dict[str, Any], limit: int = 3) -> List[Dict[str, Any]]:
+    zona = (slots.get("zona") or "").strip()
+    pmin = slots.get("presupuesto_min") or 0
+    pmax = slots.get("presupuesto_max") or 10**12
+    dorm = slots.get("dormitorios")
+    coch = slots.get("cochera")
+
+    where = ["precio BETWEEN :pmin AND :pmax"]
+    params = {"pmin": int(pmin), "pmax": int(pmax)}
+
+    if zona:
+        where.append("zona LIKE :zona")
+        params["zona"] = f"%{zona}%"
+    if dorm is not None:
+        where.append("dormitorios = :dorm")
+        params["dorm"] = int(dorm)
+    if coch in ("sí", "no"):
+        # en tu tabla: 1/0
+        where.append("cochera = :coch")
+        params["coch"] = 1 if coch == "sí" else 0
+
+    sql = f"""
+    SELECT codigo, direccion, zona, precio, dormitorios, cochera
+    FROM propiedades
+    WHERE {" AND ".join(where)}
+    ORDER BY precio ASC
+    LIMIT {limit}
+    """
+    return db_fetchall(sql, params)
+
+
+# ---------- LLM ----------
+def build_messages(slots: dict, conversation: list, user_text: str):
+    messages = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
+    messages += FEWSHOT
+
+    state_summary = {
+        "slots": {
+            "zona": slots.get("zona"),
+            "presupuesto_min": slots.get("presupuesto_min"),
+            "presupuesto_max": slots.get("presupuesto_max"),
+            "dormitorios": slots.get("dormitorios"),
+            "cochera": slots.get("cochera"),
+        },
+        "conversation": conversation[-10:],
+    }
+    messages.append({"role": "user", "content": f"ESTADO_ACTUAL_JSON={state_summary}"})
+    messages.append({"role": "user", "content": user_text})
+    return messages
+
+def ask_llm(messages: list) -> dict:
+    resp = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        temperature=0.6,
+        messages=messages
+    )
+    content = resp.choices[0].message.content
+    try:
+        data = json.loads(content)
+    except Exception:
+        # En caso de formato raro, pedimos un fallback ultra estricto
+        fallback = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0,
+            messages=[
+                {"role": "system", "content": "Devuelve exclusivamente JSON válido. Sin texto adicional."},
+                {"role": "user", "content": f"Reformatea este contenido a JSON válido: {content}"}
+            ]
+        )
+        data = json.loads(fallback.choices[0].message.content)
+    return data
+
+
+# ---------- Schemas ----------
 class QualifyIn(BaseModel):
-    message_id: Optional[str] = None
     user_phone: str
+    message_id: Optional[str] = None
     text: str
 
 class QualifyOut(BaseModel):
     text: str
-    next_question: Optional[str] = None
-    vendor_push: bool = False
+    next_question: Optional[str]
+    vendor_push: bool
     updates: Dict[str, Any]
+    suggestions: Optional[List[Dict[str, Any]]] = None
 
 
-# =========================
-# Utilidades de persistencia
-# =========================
-
-def _load_session(user_phone: str) -> Dict[str, Any]:
-    """
-    Lee la última sesión desde chat_session. Si no hay, devuelve slots vacíos.
-    """
-    try:
-        with engine.begin() as conn:
-            row = conn.execute(
-                text("""
-                    SELECT id, slots_json, last_message_id, status
-                    FROM chat_session
-                    WHERE user_phone = :p
-                    ORDER BY id DESC
-                    LIMIT 1
-                """),
-                {"p": user_phone},
-            ).first()
-
-            if row:
-                slots = row.slots_json or {}
-                # slots_json puede venir como str (según cómo esté creada la tabla)
-                if isinstance(slots, str):
-                    try:
-                        slots = json.loads(slots)
-                    except Exception:
-                        slots = {}
-                return dict(slots)
-            return {}
-    except Exception as e:
-        print("DB load error:", e)
-        # lanzamos 500 para que n8n no repita la misma pregunta en bucle
-        raise HTTPException(status_code=500, detail="DB unavailable")
-
-
-def _save_session(user_phone: str, slots: Dict[str, Any], last_message_id: Optional[str] = None):
-    """
-    Inserta o actualiza la fila de chat_session para el user_phone.
-    Si tu tabla NO tiene unique(user_phone), hacemos select+insert/update.
-    """
-    try:
-        payload = json.dumps(slots, ensure_ascii=False)
-        with engine.begin() as conn:
-            existing = conn.execute(
-                text("SELECT id FROM chat_session WHERE user_phone=:p ORDER BY id DESC LIMIT 1"),
-                {"p": user_phone},
-            ).first()
-
-            if existing:
-                conn.execute(
-                    text("""
-                        UPDATE chat_session
-                           SET slots_json=:s,
-                               last_message_id=:mid,
-                               updated_at=NOW()
-                         WHERE id=:id
-                    """),
-                    {"s": payload, "mid": last_message_id, "id": existing.id},
-                )
-            else:
-                conn.execute(
-                    text("""
-                        INSERT INTO chat_session (user_phone, slots_json, last_message_id, status, created_at, updated_at)
-                        VALUES (:p, :s, :mid, 'active', NOW(), NOW())
-                    """),
-                    {"p": user_phone, "s": payload, "mid": last_message_id},
-                )
-    except Exception as e:
-        print("DB save error:", e)
-        raise HTTPException(status_code=500, detail="DB unavailable")
-
-
-# =========================
-# Extracción/Progreso de slots
-# =========================
-
-REQUIRED_SLOTS_ORDER = ["zona", "presupuesto_min", "presupuesto_max", "dormitorios", "cochera"]
-
-def _simple_extract(slots: Dict[str, Any], user_text: str) -> Dict[str, Any]:
-    """
-    Heurísticas rápidas (sin LLM) para capturar info de forma robusta.
-    Se complementa con LLM si tenés OPENAI_API_KEY.
-    """
-    t = user_text.lower()
-
-    # zona: si hay una palabra tipo barrio conocida o el usuario menciona “barrio/zona/avenida/calle”
-    if "zona" in t or "barrio" in t or "avenida" in t or "calle" in t or "dirección" in t or "direccion" in t:
-        # toma algo simple: la última palabra significativa
-        tokens = re.findall(r"[a-záéíóúñ]+", t)
-        if tokens:
-            # preferimos la última palabra distinta de “zona/barrio”
-            for w in reversed(tokens):
-                if w not in {"zona", "barrio", "la", "el"} and len(w) > 2:
-                    slots.setdefault("zona", w.capitalize())
-                    break
-
-    # números → presupuesto o dormitorios
-    # captura todos los enteros (ej: 120000, 3)
-    nums = re.findall(r"\d{2,}|\b\d\b", t.replace(".", "").replace(",", ""))
-    if nums:
-        # si menciona “presupuesto” y hay números, úsalo
-        if "presu" in t or "$" in t:
-            val = int(nums[0])
-            if "presupuesto_min" not in slots:
-                slots["presupuesto_min"] = val
-            elif "presupuesto_max" not in slots and val >= slots.get("presupuesto_min", 0):
-                slots["presupuesto_max"] = val
-
-        # dormitorios
-        if "dorm" in t or "habit" in t or "cuarto" in t:
-            # toma el número de 1 dígito si existe
-            d = [int(n) for n in nums if len(n) == 1]
-            if d and "dormitorios" not in slots:
-                slots["dormitorios"] = d[0]
-
-    # cochera
-    if "cocher" in t:
-        if "no" in t or "sin" in t:
-            slots.setdefault("cochera", 0)
-        else:
-            slots.setdefault("cochera", 1)
-
-    return slots
-
-
-def _decide_next(slots: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Devuelve la próxima pregunta o vendor_push=True si ya está para el vendedor.
-    """
-    for s in REQUIRED_SLOTS_ORDER:
-        if not slots.get(s):
-            if s == "zona":
-                return {"slot": s, "question": "Perfecto, ¿en qué zona o dirección estás interesado?"}
-            if s == "presupuesto_min":
-                return {"slot": s, "question": "¿Cuál sería tu presupuesto mínimo aproximado (en ARS)?"}
-            if s == "presupuesto_max":
-                return {"slot": s, "question": "¿Y el presupuesto máximo?"}
-            if s == "dormitorios":
-                return {"slot": s, "question": "¿Cuántos dormitorios te gustaría?"}
-            if s == "cochera":
-                return {"slot": s, "question": "¿Necesitás cochera? (sí/no)"}
-
-    # Si todo lo básico está, empujamos al vendedor
-    return {"vendor_push": True}
-
-
-# (Opcional) Extractor con LLM – se usa solo si tenés OPENAI_API_KEY
-def _llm_enrich(slots: Dict[str, Any], user_text: str) -> Dict[str, Any]:
-    if not OPENAI_API_KEY:
-        return slots
-    try:
-        # OpenAI client nuevo (SDK v1.x)
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        prompt = f"""
-Actuás como asistente inmobiliario. A partir del mensaje del cliente,
-intentá inferir SOLO si aparecen: zona, presupuesto_min, presupuesto_max, dormitorios, cochera.
-Devolvé un JSON con esas claves (si no podés inferir una, déjala nula).
-Mensaje del cliente: {user_text}
-"""
-        rsp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Devolvé solo JSON válido. Sin texto adicional."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-        )
-        content = rsp.choices[0].message.content.strip()
-        inferred = json.loads(content)
-
-        # merge sin pisar valores ya confirmados
-        for k in ["zona", "presupuesto_min", "presupuesto_max", "dormitorios", "cochera"]:
-            v = inferred.get(k)
-            if v and slots.get(k) in (None, "", 0):
-                slots[k] = v
-    except Exception as e:
-        print("LLM enrich error:", e)
-    return slots
-
-
-# =========================
-# Endpoints
-# =========================
-
+# ---------- API ----------
 @app.get("/healthz")
 def healthz():
-    with engine.connect() as c:
-        c.execute(text("SELECT 1"))
     return {"ok": True}
 
-
 @app.post("/qualify", response_model=QualifyOut)
-def qualify(payload: QualifyIn):
-    """
-    Entrada esperada (desde n8n):
-    {
-      "message_id": "...",            // opcional
-      "user_phone": "5493412....",
-      "text": "texto del cliente"
-    }
-    """
-    user_phone = payload.user_phone
-    user_text = (payload.text or "").strip()
-
+def qualify(payload: QualifyIn = Body(...)):
+    user_phone = normalize_phone(payload.user_phone)
     if not user_phone:
-        raise HTTPException(status_code=400, detail="user_phone required")
-    if not user_text:
-        # si no hay texto, no hacemos nada
-        return QualifyOut(
-            text="",
-            next_question=None,
-            vendor_push=False,
-            updates={"slots": {}},
-        )
+        raise HTTPException(status_code=400, detail="user_phone inválido")
 
-    # 1) cargar slots previos
-    slots = _load_session(user_phone)
+    # 1) Traemos/creamos sesión
+    session = get_or_create_session(user_phone)
+    slots: Dict[str, Any] = {}
+    try:
+        slots = json.loads(session.get("slots_json") or "{}")
+    except Exception:
+        slots = {}
 
-    # 2) heurísticas rápidas
-    slots = _simple_extract(slots, user_text)
+    # Historial de conversación básico
+    conversation = slots.get("conversation") or []
+    conversation.append({"role": "user", "content": payload.text})
 
-    # 3) (opcional) enriquecer con LLM
-    slots = _llm_enrich(slots, user_text)
+    # 2) Preguntamos al LLM
+    messages = build_messages(slots, conversation, payload.text)
+    reply = ask_llm(messages)
 
-    # 4) decidir siguiente paso
-    nxt = _decide_next(slots)
+    # 3) Normalizamos slots que devuelve el LLM
+    new_slots = reply.get("updates", {}).get("slots", {}) if isinstance(reply.get("updates"), dict) else {}
+    # merge de estado
+    merged = {
+        "zona": new_slots.get("zona", slots.get("zona")),
+        "presupuesto_min": new_slots.get("presupuesto_min", slots.get("presupuesto_min")),
+        "presupuesto_max": new_slots.get("presupuesto_max", slots.get("presupuesto_max")),
+        "dormitorios": new_slots.get("dormitorios", slots.get("dormitorios")),
+        "cochera": new_slots.get("cochera", slots.get("cochera")),
+    }
 
-    # 5) armar respuesta natural (agente)
-    if nxt.get("vendor_push"):
-        # resumen corto para el cliente
-        zona = slots.get("zona", "N/D")
-        pmin = slots.get("presupuesto_min", "N/D")
-        pmax = slots.get("presupuesto_max", "N/D")
-        dorm = slots.get("dormitorios", "N/D")
-        coch = "sí" if slots.get("cochera") == 1 else ("no" if slots.get("cochera") == 0 else "N/D")
+    # Limpieza de tipos
+    if merged["presupuesto_min"] is not None:
+        merged["presupuesto_min"] = to_ars_number(str(merged["presupuesto_min"]))
+    if merged["presupuesto_max"] is not None:
+        merged["presupuesto_max"] = to_ars_number(str(merged["presupuesto_max"]))
+    if merged["dormitorios"] is not None:
+        try:
+            merged["dormitorios"] = int(str(merged["dormitorios"]))
+        except Exception:
+            merged["dormitorios"] = None
+    if merged["cochera"] is not None:
+        merged["cochera"] = safe_bool_yesno(merged["cochera"])
 
-        reply = (
-            "¡Genial! Ya tengo lo principal.\n"
-            f"- Zona: {zona}\n"
-            f"- Presupuesto: {pmin} a {pmax}\n"
-            f"- Dormitorios: {dorm}\n"
-            f"- Cochera: {coch}\n\n"
-            "Le paso tu consulta al asesor y te escribe en breve 🧑‍💼"
-        )
-        # 6) persistir y responder
-        _save_session(user_phone, slots, payload.message_id)
-        return QualifyOut(
-            text=reply,
-            next_question=None,
-            vendor_push=True,  # <- clave para n8n
-            updates={"slots": slots},
-        )
-    else:
-        question = nxt["question"]
-        # si faltan varias cosas, guiamos suave
-        if "zona" in nxt["slot"]:
-            lead = "Gracias. Para avanzar, contame la zona/dirección y un presupuesto estimado; después vemos dormitorios y cochera. 🙂\n"
-            reply = lead + question
-        else:
-            reply = question
+    # 4) Adjuntamos conversación al estado
+    assistant_text = str(reply.get("text") or "").strip()
+    next_q = reply.get("next_question")
+    vendor_push = bool(reply.get("vendor_push") is True)
 
-        _save_session(user_phone, slots, payload.message_id)
-        return QualifyOut(
-            text=reply,
-            next_question=question,
-            vendor_push=False,
-            updates={"slots": slots},
-        )
+    conversation.append({"role": "assistant", "content": assistant_text})
+    merged["conversation"] = conversation
+
+    # 5) Guardamos sesión y actualizamos lead
+    update_session(user_phone, merged)
+    vendor_phone = os.getenv("VENDOR_PHONE", "5493412654593")  # tu default
+    ensure_lead_row(user_phone, vendor_phone)
+    update_lead_from_slots(user_phone, merged)
+
+    # 6) Si ya está calificado, sugerimos propiedades (hasta 3)
+    suggestions = None
+    if vendor_push and merged.get("zona") and merged.get("presupuesto_min") and merged.get("presupuesto_max"):
+        props = suggest_properties(merged, limit=3)
+        if props:
+            # Formateo corto, no invasivo
+            lines = []
+            for p in props:
+                cochera_txt = "sí" if p.get("cochera") == 1 else "no"
+                lines.append(f"- {p['codigo']} • {p['direccion']} ({p['zona']}) • ${p['precio']} • {p['dormitorios']} dorm • cochera {cochera_txt}")
+            # agregamos una línea final amable
+            extra = "\n\nTe comparto algunas opciones que encajan con lo que buscás:\n" + "\n".join(lines)
+            assistant_text = (assistant_text + extra)[:1500]  # por las dudas
+            suggestions = props
+
+    response = {
+        "text": assistant_text,
+        "next_question": next_q if next_q else None,
+        "vendor_push": vendor_push,
+        "updates": {"slots": merged},
+        "suggestions": suggestions
+    }
+    return response
