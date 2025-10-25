@@ -7,6 +7,20 @@ from pydantic import BaseModel
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+
+# --- Force PyMySQL no matter what ---
+import os
+
+try:
+    import pymysql
+    pymysql.install_as_MySQLdb()  # si algo intenta cargar MySQLdb, usará PyMySQL
+except Exception:
+    pass
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+if DATABASE_URL.startswith("mysql://"):
+    DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
+
 # --------- Config ----------
 DATABASE_URL = os.getenv("DATABASE_URL")  # mysql+pymysql://...
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
