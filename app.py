@@ -9,7 +9,6 @@ from sqlalchemy.orm import sessionmaker
 
 
 # --- Force PyMySQL no matter what ---
-import os
 
 try:
     import pymysql
