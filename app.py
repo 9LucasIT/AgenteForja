@@ -7,6 +7,32 @@ from datetime import datetime
 import random
 import os
 
+
+import re
+import unicodedata
+
+def _norm(txt: str) -> str:
+    if not txt:
+        return ""
+    # minúsculas + sin acentos
+    txt = unicodedata.normalize("NFD", txt).encode("ascii", "ignore").decode("utf-8")
+    return re.sub(r"\s+", " ", txt.lower()).strip()
+
+def detect_operacion(txt: str) -> str | None:
+    t = _norm(txt)
+    rent_keys = (
+        "alquiler", "alquilo", "alquilar", "renta", "rent", "en alquiler"
+    )
+    sell_keys = (
+        "venta", "vendo", "vender", "comprar", "compro", "en venta"
+    )
+    if any(k in t for k in rent_keys):
+        return "alquiler"
+    if any(k in t for k in sell_keys):
+        return "venta"
+    return None
+
+
 # === CONFIGURACIÓN BASE ===
 
 app = FastAPI()
