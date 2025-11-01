@@ -1,4 +1,4 @@
-# app.py — Veglienzone WhatsApp Lead Agent (FastAPI)
+# app.py — Veglienzone WhatsApp Lead Agent (FastAPI, Green inbound directo)
 import os, re, json
 from typing import Optional, List, Dict
 from fastapi import FastAPI
@@ -7,25 +7,25 @@ from pydantic import BaseModel
 from collections import defaultdict
 
 # =========================
-# 1) PROMPT DEL ASESOR
+# PROMPT DEL ASESOR
 # =========================
 AGENT_PROMPT = """
 Sos el ASESOR COMERCIAL de Inmobiliaria Veglienzone (Rosario). Hablás como humano:
-cálido, claro y profesional. Una (1) pregunta por turno. No sos un bot, no uses frases robóticas ni tecnicismos.
+cálido, claro y profesional. Una (1) pregunta por turno. No uses frases robóticas.
 
 OBJETIVO:
 - Resolver la consulta y calificar al cliente para derivarlo a un asesor humano por WhatsApp.
 - NO coordinás horarios ni agendas visitas.
 
-SALUDO INICIAL (solo en el primer turno del chat o tras “reset”):
+SALUDO INICIAL (solo primer turno o tras “reset”):
 "Gracias por contactarte con el área comercial de Veglienzone Gestión Inmobiliaria. ¿Cómo podemos ayudarte hoy?
 1- Alquileres
 2- Ventas
 3- Tasaciones"
 
 ESCENARIO A — PROPIEDAD ESPECÍFICA (dirección, código o link):
-- Confirmá la unidad y respondé preguntas típicas de ficha (zona, tipo, precio, dormitorios, cochera, amenities, expensas si aplica).
-- Si el cliente está interesado (“me sirve”, “¿podemos avanzar?”, “pasame contacto”, “quiero ver”), ofrecé derivarlo a un asesor humano. Si acepta → vendor_push=true.
+- Confirmá la unidad y respondé preguntas de ficha (zona, tipo, precio, dormitorios, cochera, amenities, expensas).
+- Si el cliente se interesa, ofrecé derivarlo a un asesor humano. Si acepta → vendor_push=true.
 
 ESCENARIO B — BÚSQUEDA GENERAL:
 - Calificá con UNA pregunta por turno, solo lo que falte:
@@ -35,34 +35,35 @@ ESCENARIO B — BÚSQUEDA GENERAL:
   • Dormitorios/ambientes
   • Presupuesto (rango o tope)
   • Cochera y mascotas (si corresponde)
-- Con datos suficientes, ofrecé 2–3 opciones sintéticas o pedí el dato faltante clave.
+- Con datos suficientes, ofrecé 2–3 opciones o pedí el dato faltante clave.
 
 REGLAS DEL NEGOCIO:
-- ALQUILER: preguntar (si falta) si tiene ingresos demostrables que TRIPLIQUEN el costo del alquiler, qué tipo de garantía usaría (seguro de caución Finaer u otra garantía propietaria), cuántos habitantes y si tiene mascotas.
-- VENTA: no se aceptan m² como parte de pago ni vehículos (no considerar canjes de ese tipo). Aclaralo amablemente si lo proponen.
-- Derivación: si el cliente confirma que quiere hablar con un asesor, seteá vendor_push=true y prepará vendor_message.
-- Canal único: WhatsApp. No coordines disponibilidad horaria ni visites.
+- ALQUILER: preguntar (si falta) si tiene ingresos demostrables que TRIPLIQUEN el costo del alquiler, qué tipo de garantía usaría
+  (seguro de caución Finaer u otra garantía propietaria), cuántos habitantes y si tiene mascotas.
+- VENTA: no se aceptan m² ni vehículos como parte de pago (aclaralo amablemente si lo proponen).
+- Derivación: si confirma que quiere que lo contacten, seteá vendor_push=true y prepará vendor_message.
+- Canal único: WhatsApp. No coordines disponibilidad ni visitas.
 
-FORMATO DE SALIDA — devolvé SOLO este JSON:
+FORMATO (devolvé SOLO este JSON):
 {
-  "reply_text": "texto humano para el cliente (una pregunta por turno, o respuesta a su consulta)",
-  "closing_text": "mensaje final si ya se deriva a asesor (vacío si no aplica)",
+  "reply_text": "texto para el cliente",
+  "closing_text": "mensaje final si se deriva (vacío si no aplica)",
   "vendor_push": true/false,
-  "vendor_message": "resumen para el asesor humano: cliente (si lo dio), WhatsApp, operación, zona/dirección, tipo, dormitorios, presupuesto, cochera/mascotas; si es ALQUILER incluir ingresos x3 y tipo de garantía; en VENTA recordar que no se aceptan m² ni vehículos."
+  "vendor_message": "resumen claro para el asesor: operación, zona/dirección, tipo, dormitorios, presupuesto, cochera/mascotas; en ALQUILER incluir ingresos x3 y tipo de garantía; en VENTA recordar que no se aceptan m² ni vehículos."
 }
 
 CRITERIOS vendor_push=true:
 - El cliente pide contacto/visita/avanzar, o
-- Ya aportó datos suficientes (≥3 de: operación, zona/dirección, tipo y [dormitorios o presupuesto]).
-- Cuando vendor_push=true, pedile confirmación suave: “¿Querés que te contacte un asesor por este WhatsApp?” Si responde afirmativo, incluí closing_text con el aviso de derivación.
+- Aporta datos suficientes (≥3 de: operación, zona/dirección, tipo y [dormitorios o presupuesto]).
+- Cuando vendor_push=true, preguntá: “¿Querés que te contacte un asesor por este WhatsApp?” Si responde que sí, incluí closing_text.
 
 RECORDATORIO:
-- Jamás escribir fuera del JSON. No menciones que sos IA.
-- Si es el primer turno (o tras “reset”), usá el saludo inicial.
+- No escribas nada fuera del JSON.
+- Si es primer turno (o tras “reset”), usá el saludo inicial.
 """
 
 # =========================
-# 2) MEMORIA POR chatId
+# MEMORIA POR chatId
 # =========================
 memory = defaultdict(list)
 
@@ -80,7 +81,7 @@ def clear_memory(chat_id: str):
     memory.pop(chat_id, None)
 
 # =========================
-# 3) EXTRACCIÓN LIGERA DE CONTEXTO
+# HINTS: detectar propiedad específica
 # =========================
 URL_RE = re.compile(r'https?://\S+', re.IGNORECASE)
 CODE_RE = re.compile(r'\b([A-Za-z]\d{2,5})\b')                   # ej: A101, C244
@@ -100,34 +101,28 @@ def extract_specific_refs(text: str) -> Dict[str,str]:
     return out
 
 def build_messages(chat_id: str, user_text: str, is_first_turn: bool) -> List[Dict]:
-    msgs = []
-    # memoria previa (sin duplicar prompts)
+    msgs: List[Dict] = []
     for m in get_memory(chat_id):
         msgs.append(m)
-
-    # prompt del asesor
     msgs.append({"role": "system", "content": AGENT_PROMPT})
 
-    # hint si detectamos propiedad específica
     refs = extract_specific_refs(user_text)
     if refs:
         hint = "HINT: El cliente menciona una PROPIEDAD ESPECÍFICA. "
         if "link" in refs:    hint += f"Link: {refs['link']}. "
         if "code" in refs:    hint += f"Código: {refs['code']}. "
         if "address" in refs: hint += f"Dirección: {refs['address']}. "
-        hint += "Respondé consultas de FICHA y, si se interesa, ofrecé derivación a un asesor humano."
+        hint += "Respondé como ficha y, si hay interés, ofrecé derivación a un asesor humano."
         msgs.append({"role": "system", "content": hint})
 
-    # marca de primer turno
     if is_first_turn:
-        msgs.append({"role": "system", "content": "PRIMER_TURNO: usá el saludo inicial antes de calificar."})
+        msgs.append({"role": "system", "content": "PRIMER_TURNO: usá el saludo inicial."})
 
-    # entrada de usuario
     msgs.append({"role": "user", "content": user_text})
     return msgs
 
 # =========================
-# 4) LLM (OpenAI) con fallback mock
+# LLM (OpenAI) con fallback
 # =========================
 _OPENAI_OK = False
 try:
@@ -145,7 +140,6 @@ TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.4"))
 MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "400"))
 
 def call_llm(messages: List[Dict]) -> str:
-    # real
     if client is not None:
         resp = client.chat.completions.create(
             model=MODEL,
@@ -154,16 +148,16 @@ def call_llm(messages: List[Dict]) -> str:
             max_tokens=MAX_TOKENS,
         )
         return resp.choices[0].message.content or ""
-    # mock (sin API key)
+    # fallback sin API key (para no romper)
     return json.dumps({
-        "reply_text": "Entendido. ¿La búsqueda es para alquiler o para venta, y en qué zona?",
+        "reply_text": "¿La búsqueda es para alquiler o para venta, y en qué zona?",
         "closing_text": "",
         "vendor_push": False,
         "vendor_message": ""
     })
 
 # =========================
-# 5) FASTAPI
+# FASTAPI
 # =========================
 class Inbound(BaseModel):
     user_phone: Optional[str] = ""
@@ -181,6 +175,18 @@ app.add_middleware(
 def health():
     return {"ok": True}
 
+@app.get("/debug")
+def debug():
+    mode = "openai" if os.getenv("OPENAI_API_KEY") else "mock"
+    return {
+        "llm_mode": mode,
+        "memory_sessions": len(memory),
+        "OPENAI_MODEL": os.getenv("OPENAI_MODEL", ""),
+        "GREEN_ID": os.getenv("GREEN_ID", ""),
+        "GREEN_TOKEN": "***" if os.getenv("GREEN_TOKEN") else "",
+        "N8N_VENDOR_WEBHOOK": "***" if os.getenv("N8N_VENDOR_WEBHOOK") else "",
+    }
+
 def parse_agent_json(text: str) -> Dict:
     base = {"reply_text": "", "closing_text": "", "vendor_push": False, "vendor_message": ""}
     if not text:
@@ -190,10 +196,10 @@ def parse_agent_json(text: str) -> Dict:
     if start != -1 and end != -1 and end > start:
         try:
             data = json.loads(text[start:end+1])
-            base["reply_text"]    = (data.get("reply_text") or "").strip()
-            base["closing_text"]  = (data.get("closing_text") or "").strip()
-            base["vendor_push"]   = bool(data.get("vendor_push", False))
-            base["vendor_message"]= (data.get("vendor_message") or "").strip()
+            base["reply_text"]     = (data.get("reply_text") or "").strip()
+            base["closing_text"]   = (data.get("closing_text") or "").strip()
+            base["vendor_push"]    = bool(data.get("vendor_push", False))
+            base["vendor_message"] = (data.get("vendor_message") or "").strip()
             return base
         except Exception:
             pass
@@ -205,7 +211,7 @@ def qualify(payload: Inbound):
     chat_id = payload.user_phone or "unknown"
     text_in = (payload.text or "").strip()
 
-    # reset conversacional
+    # reset
     if text_in.lower() in {"reset", "reiniciar", "nuevo"}:
         clear_memory(chat_id)
         return {
@@ -215,31 +221,79 @@ def qualify(payload: Inbound):
             "vendor_message": ""
         }
 
-    # ¿es primer turno?
     is_first = len(get_memory(chat_id)) == 0
-
-    # construir mensajes (memoria + prompt + hint + user)
     messages = build_messages(chat_id, text_in, is_first)
-
-    # llamar LLM y parsear
     raw = call_llm(messages)
     out = parse_agent_json(raw)
 
-    # si el modelo decide vendor_push pero NO deja vendor_message, fabricamos uno claro
     if out.get("vendor_push") and not (out.get("vendor_message") or "").strip():
-        out["vendor_message"] = f"LEAD CALIFICADO – Veglienzone | WhatsApp: +{payload.user_phone} | Contexto: {text_in[:200]}"
+        out["vendor_message"] = f"LEAD CALIFICADO – Veglienzone | WhatsApp +{payload.user_phone} | Contexto: {text_in[:200]}"
 
-    # guardar memoria de turno
     add_to_memory(chat_id, "user", text_in)
     add_to_memory(chat_id, "assistant", out.get("reply_text", ""))
 
-    # saneo final
     return {
         "reply_text": (out.get("reply_text") or "").strip()[:3000],
         "closing_text": (out.get("closing_text") or "").strip()[:2000],
         "vendor_push": bool(out.get("vendor_push", False)),
         "vendor_message": (out.get("vendor_message") or "").strip()[:3000],
     }
+
+# ============ GREEN INBOUND DIRECTO ============
+class GreenInbound(BaseModel):
+    typeWebhook: Optional[str] = ""
+    instanceData: Optional[dict] = None
+    timestamp: Optional[int] = None
+    idMessage: Optional[str] = ""
+    senderData: Optional[dict] = None
+    messageData: Optional[dict] = None
+
+@app.post("/api/green/inbound")
+def green_inbound(ev: GreenInbound):
+    # Solo procesamos mensajes entrantes de cliente
+    if (ev.typeWebhook or "").lower() != "incomingmessagereceived":
+        return {"ok": True}
+
+    chat_id = (ev.senderData or {}).get("chatId", "")
+    user_phone = chat_id.replace("@c.us","") if chat_id else ""
+    text = ""
+    md = ev.messageData or {}
+    if (md.get("typeMessage") == "textMessage") and md.get("textMessageData"):
+        text = (md["textMessageData"].get("textMessage") or "").strip()
+
+    # Reutilizamos /qualify
+    result = qualify(Inbound(user_phone=user_phone, text=text))
+
+    # Responder al cliente por Green
+    import requests
+    idInstance = os.getenv("GREEN_ID")
+    apiToken = os.getenv("GREEN_TOKEN")
+    if idInstance and apiToken and chat_id:
+        url = f"https://api.green-api.com/waInstance{idInstance}/sendMessage/{apiToken}"
+        try:
+            requests.post(url, json={"chatId": chat_id, "message": result["reply_text"]}, timeout=10)
+        except Exception:
+            pass
+        if result.get("closing_text"):
+            try:
+                requests.post(url, json={"chatId": chat_id, "message": result["closing_text"]}, timeout=10)
+            except Exception:
+                pass
+
+    # Si hay handoff al vendedor, avisamos a n8n (solo aquí)
+    if result.get("vendor_push"):
+        n8n_url = os.getenv("N8N_VENDOR_WEBHOOK")
+        if n8n_url:
+            try:
+                import requests
+                requests.post(n8n_url, json={
+                    "vendor_message": result["vendor_message"],
+                    "client_phone": user_phone
+                }, timeout=10)
+            except Exception:
+                pass
+
+    return {"ok": True}
 
 if __name__ == "__main__":
     import uvicorn
