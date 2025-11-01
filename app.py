@@ -1,7 +1,7 @@
 # app.py — Veglienzone WhatsApp Lead Agent (FastAPI + OpenAI + Green-API inbound)
 import os, re, json, time
 from typing import Optional, List, Dict
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from collections import defaultdict
@@ -69,8 +69,9 @@ RECORDATORIO:
 # MEMORIA Y GUARDAS
 # =========================
 memory = defaultdict(list)            # chatId -> [{"role":...,"content":...}]
-last_msg_by_chat = {}                 # chatId -> last idMessage (evita duplicados)
+last_msg_by_chat = {}                 # chatId -> last idMessage (evita duplicados de entrada)
 last_ts_by_chat = {}                  # chatId -> last timestamp (rate-limit simple)
+last_sent_by_chat = {}                # chatId -> {"text": str, "ts": float} (evita doble envío de salida)
 
 def add_to_memory(chat_id: str, role: str, content: str):
     if not content:
@@ -116,7 +117,7 @@ def mentions_specific_without_data(text: str) -> bool:
     return has_hint and not has_ref
 
 # =========================
-# CONTROL DE SALUDO REPETIDO
+# CONTROL DE SALUDO REPETIDO + ANTI DOBLE ENVÍO
 # =========================
 GREETING_SNIPPET = "Gracias por contactarte con el área comercial de Veglienzone"
 
@@ -132,6 +133,20 @@ def clean_greeting(reply_text: str, is_first_turn: bool) -> str:
         rest = "\n".join(lines[i:]).strip()
         return rest or "Perfecto, contame un poco más así te ayudo."
     return reply_text
+
+import time as _time
+def _should_send(chat_id: str, text: str, window_sec: float = 6.0) -> bool:
+    """
+    Evita mandar dos veces el mismo texto al mismo chat en una ventana corta.
+    Retorna True si se debe enviar; False si se considera duplicado inmediato.
+    """
+    if not chat_id or not text:
+        return False
+    rec = last_sent_by_chat.get(chat_id, {"text": None, "ts": 0.0})
+    if rec["text"] == text and (_time.time() - rec["ts"]) < window_sec:
+        return False
+    last_sent_by_chat[chat_id] = {"text": text, "ts": _time.time()}
+    return True
 
 # =========================
 # ARMADO DE MENSAJES PARA IA
@@ -186,7 +201,7 @@ def call_llm(messages: List[Dict]) -> str:
             max_tokens=MAX_TOKENS,
         )
         return resp.choices[0].message.content or ""
-    # fallback SC (solo para no romper si falta API key)
+    # fallback (si falta API key)
     return json.dumps({
         "reply_text": "¿La búsqueda es para alquiler o para venta, y en qué zona?",
         "closing_text": "",
@@ -264,7 +279,14 @@ def qualify(payload: Inbound):
     if text_in.lower() in {"reset", "reiniciar", "nuevo"}:
         clear_memory(chat_id)
         return {
-            "reply_text": "Gracias por contactarte con el área comercial de Veglienzone Gestión Inmobiliaria. ¿Cómo podemos ayudarte hoy?\n1- Alquileres\n2- Ventas\n3- Tasaciones",
+            "reply_text": (
+                "Gracias por contactarte con el área comercial de Veglienzone Gestión Inmobiliaria. "
+                "¿Cómo podemos ayudarte hoy?\n"
+                "1- Alquileres\n"
+                "2- Ventas\n"
+                "3- Tasaciones\n\n"
+                "Nota: si en cualquier momento escribís *reset*, la conversación se reinicia desde cero."
+            ),
             "closing_text": "",
             "vendor_push": False,
             "vendor_message": ""
@@ -289,6 +311,8 @@ def qualify(payload: Inbound):
 
     # anti-saludo repetido
     out["reply_text"] = clean_greeting(out.get("reply_text", ""), is_first)
+    if is_first and GREETING_SNIPPET.lower() in out["reply_text"].lower():
+        out["reply_text"] += "\n\nNota: si en cualquier momento escribís *reset*, la conversación se reinicia desde cero."
 
     if out.get("vendor_push") and not (out.get("vendor_message") or "").strip():
         out["vendor_message"] = f"LEAD CALIFICADO – Veglienzone | WhatsApp +{payload.user_phone} | Contexto: {text_in[:200]}"
@@ -319,35 +343,38 @@ def green_inbound(ev: GreenInbound):
     if (md.get("typeMessage") == "textMessage") and md.get("textMessageData"):
         text = (md["textMessageData"].get("textMessage") or "").strip()
 
-    # --------- guardas anti duplicado / rate limit ---------
-    # Evita procesar dos veces el mismo idMessage
+    # --------- guardas anti duplicado / rate limit (de entrada) ---------
     if ev.idMessage and chat_id:
         if last_msg_by_chat.get(chat_id) == ev.idMessage:
             return {"ok": True}
         last_msg_by_chat[chat_id] = ev.idMessage
-    # Evita bucles por latencia (2s de ventana mínima)
     now = time.time()
     last_ts = last_ts_by_chat.get(chat_id, 0)
     if now - last_ts < 2.0:
         return {"ok": True}
     last_ts_by_chat[chat_id] = now
-    # -------------------------------------------------------
+    # -------------------------------------------------------------------
 
     result = qualify(Inbound(user_phone=user_phone, text=text))
 
-    # Responder al cliente por Green
+    # Responder al cliente por Green (con anti-doble-envío de salida)
     import requests
     idInstance = os.getenv("GREEN_ID")
     apiToken   = os.getenv("GREEN_TOKEN")
-    if idInstance and apiToken and chat_id and result.get("reply_text"):
+    if idInstance and apiToken and chat_id:
         url = f"https://api.green-api.com/waInstance{idInstance}/sendMessage/{apiToken}"
-        try:
-            requests.post(url, json={"chatId": chat_id, "message": result["reply_text"]}, timeout=10)
-        except Exception:
-            pass
-        if result.get("closing_text"):
+
+        reply_text = (result.get("reply_text") or "").strip()
+        if reply_text and _should_send(chat_id, reply_text):
             try:
-                requests.post(url, json={"chatId": chat_id, "message": result["closing_text"]}, timeout=10)
+                requests.post(url, json={"chatId": chat_id, "message": reply_text}, timeout=10)
+            except Exception:
+                pass
+
+        closing_text = (result.get("closing_text") or "").strip()
+        if closing_text and _should_send(chat_id, closing_text):
+            try:
+                requests.post(url, json={"chatId": chat_id, "message": closing_text}, timeout=10)
             except Exception:
                 pass
 
