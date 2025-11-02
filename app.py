@@ -3,477 +3,445 @@ import os
 import re
 import time
 import json
-import logging
-from typing import Optional, Dict, Any, List
+import math
+import httpx
+import asyncio
+import unicodedata
+from difflib import SequenceMatcher
+from typing import Optional, Dict, Any
 
-import requests
 from fastapi import FastAPI, Body
-from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-# ----------------------------------
+# ==========
 # Config
-# ----------------------------------
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-VENDOR_PHONE = os.getenv("VENDOR_PHONE", "5493412654593")
-TOKKO_API_KEY = os.getenv("TOKKO_API_KEY", "")  # <-- ya lo tenés en Railway
-SITE_LINK = "https://www.veglienzone.com.ar/"
+# ==========
+TOKKO_API_KEY = os.getenv("TOKKO_API_KEY", "").strip()
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("veglienzone-agent")
-
-app = FastAPI(title="Veglienzone AI Agent")
-
-# ----------------------------------
-# Memoria de sesión simple en memoria
-# ----------------------------------
-# Nota: es memoria efímera (se reinicia al redeploy). Para producción real,
-# conviene Redis o DB. Suficiente para test y costos bajos.
-SESSIONS: Dict[str, Dict[str, Any]] = {}
-SESSION_TTL_SECONDS = 60 * 60 * 8  # 8h de inactividad
-
-
-def now() -> float:
-    return time.time()
-
-
-def session(chat_id: str) -> Dict[str, Any]:
-    s = SESSIONS.get(chat_id)
-    if not s or now() - s.get("_ts", 0) > SESSION_TTL_SECONDS:
-        s = {
-            "_ts": now(),
-            "state": "welcome",
-            "op": None,  # 'alquiler' | 'venta'
-            "address": None,
-            "tokko_hits": [],
-            "exact": None,  # ficha exacta
-            "qual": {
-                "ingresos": None,
-                "garantia": None,
-                "habitantes": None,
-                "mascotas": None,
-            },
-        }
-        SESSIONS[chat_id] = s
-    else:
-        s["_ts"] = now()
-    return s
-
-
-def reset_session(chat_id: str):
-    if chat_id in SESSIONS:
-        del SESSIONS[chat_id]
-    session(chat_id)
-
-
-# ----------------------------------
-# Utilidades de texto
-# ----------------------------------
-def norm(text: str) -> str:
-    return re.sub(r"\s+", " ", (text or "")).strip().lower()
-
-
-def looks_like_url(text: str) -> bool:
-    return bool(re.search(r"https?://", text or "", re.I))
-
-
-def looks_like_address(text: str) -> bool:
-    # Heurística simple: palabra + número (ej. "Av. Cabildo 2853")
-    return bool(re.search(r"[a-zA-ZÁÉÍÓÚÑáéíóúñ]+\s+\d{1,6}", text or ""))
-
-
-def said_no_address(text: str) -> bool:
-    t = norm(text)
-    return any(
-        kw in t
-        for kw in [
-            "no tengo dirección",
-            "no tengo direccion",
-            "no tengo link",
-            "sin dirección",
-            "sin direccion",
-            "sin link",
-            "busco por zona",
-            "busco por barrio",
-            "no tengo ni link ni dirección",
-            "no tengo ni link ni direccion",
-            "no tengo nada",
-        ]
-    )
-
-
-def is_yes(text: str) -> bool:
-    return norm(text) in {"si", "sí", "ok", "dale", "de una", "si, por favor", "sí, por favor", "quiero"}
-
-
-def is_no(text: str) -> bool:
-    return norm(text) in {"no", "nop", "no gracias", "gracias, no", "por ahora no"}
-
-
-def extract_op(text: str) -> Optional[str]:
-    t = norm(text)
-    if re.search(r"\b(1|alquiler|alquilo|alquilar|renta|rent)\b", t):
-        return "alquiler"
-    if re.search(r"\b(2|venta|compro|comprar|vende|vendo)\b", t):
-        return "venta"
-    return None
-
-
-# ----------------------------------
-# Tokko API
-# ----------------------------------
-TOKKO_BASE = "https://api.tokkobroker.com/api/v1/property/"
-
-def tokko_headers():
-    return {"Accept": "application/json"}
-
-def tokko_query(params: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Llama a Tokko /property con el token. Maneja errores de red.
-    """
-    if not TOKKO_API_KEY:
-        raise RuntimeError("Falta TOKKO_API_KEY en variables de entorno.")
-
-    q = {"auth_token": TOKKO_API_KEY, "format": "json"}
-    q.update(params or {})
-    try:
-        r = requests.get(TOKKO_BASE, params=q, headers=tokko_headers(), timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log.exception("Tokko error: %s", e)
-        return {"objects": []}
-
-def normalize_addr(s: str) -> str:
-    s = s or ""
-    s = s.replace(".", " ")
-    s = re.sub(r"\s+", " ", s).strip().lower()
-    return s
-
-def tokko_search_by_address(address: str) -> List[Dict[str, Any]]:
-    """
-    Devuelve lista de propiedades candidatas. Usa búsqueda amplia por dirección.
-    """
-    # Estrategia: 1) intentar por "search" (full-text), 2) fallback por "address"
-    data = tokko_query({"search": address, "limit": 10})
-    objs = data.get("objects") or []
-
-    # orden simple: coincidencias que contengan el número exacto primero
-    num = re.findall(r"\d{1,6}", address or "")
-    hits = []
-    for it in objs:
-        addr = (it.get("address") or "") + " " + (it.get("location", {}).get("name") or "")
-        score = 0
-        if address.lower() in addr.lower():
-            score += 3
-        if num and any(n in addr for n in num):
-            score += 2
-        if it.get("code"):
-            score += 1
-        hits.append((score, it))
-    hits.sort(key=lambda x: x[0], reverse=True)
-    return [h[1] for h in hits]
-
-def tokko_exact_match(address: str, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    target = normalize_addr(address)
-    for it in candidates:
-        addr = normalize_addr(it.get("address") or "")
-        if addr == target:
-            return it
-    # también aceptar coincidencia fuerte “calle + número”
-    calle_num = re.findall(r"[a-zA-ZÁÉÍÓÚÑáéíóúñ]+\s+\d{1,6}", address)
-    if calle_num:
-        pat = normalize_addr(calle_num[0])
-        for it in candidates:
-            if pat in normalize_addr(it.get("address") or ""):
-                return it
-    return None
-
-def fmt_price(obj: Dict[str, Any]) -> str:
-    currency = (obj.get("price_currency") or obj.get("currency") or "USD").upper()
-    price = obj.get("price") or obj.get("price_total") or obj.get("price_list") or 0
-    try:
-        price = int(float(price))
-        price_txt = f"{price:,}".replace(",", ".")
-    except Exception:
-        price_txt = str(price)
-    return f"{currency} {price_txt}"
-
-def property_summary(obj: Dict[str, Any]) -> str:
-    code = obj.get("code", "")
-    addr = obj.get("address", "Sin dirección")
-    loc = obj.get("location", {}).get("name") or ""
-    op = (obj.get("operation", {}) or {}).get("name") or obj.get("operation_type") or "Operación"
-    price = fmt_price(obj)
-    dorm = obj.get("bedrooms", 0)
-    baths = obj.get("bathrooms", 0)
-    covered = obj.get("covered_surface") or obj.get("surface_covered") or 0
-    total = obj.get("surface_total") or obj.get("surface") or 0
-    amb = obj.get("ambiences") or obj.get("rooms") or 0
-    url = obj.get("web_url") or obj.get("url") or SITE_LINK
-
-    lines = [
-        f"• Código: {code}",
-        f"• Dirección: {addr}" + (f" ({loc})" if loc else ""),
-        f"• Operación: {op}",
-        f"• Precio: {price}",
-        f"• Dormitorios: {dorm} | Baños: {baths}",
-        f"• Sup. cubierta: {covered} m² | Sup. total: {total} m²",
-        f"• Ambientes: {amb}",
-        f"• Ficha: {url}",
-    ]
-    return "\n".join(lines)
-
-def list_summary(objs: List[Dict[str, Any]]) -> str:
-    out = []
-    for i, o in enumerate(objs[:3], 1):
-        out.append(f"{i}) {o.get('address','Sin dirección')} – {fmt_price(o)} – {(o.get('operation',{}) or {}).get('name','')}")
-    if not out:
-        return "No encontré coincidencias para esa dirección."
-    return "\n".join(out)
-
-
-# ----------------------------------
-# Esquema de entrada/salida /qualify
-# ----------------------------------
-class QualifyIn(BaseModel):
-    chatId: str
-    message: str
-    isFromMe: Optional[bool] = False
-    senderName: Optional[str] = ""
-
-
-class QualifyOut(BaseModel):
-    reply_text: str = ""
-    closing_text: str = ""
-    vendor_push: bool = False
-    vendor_message: str = ""
-
-
-# ----------------------------------
-# Lógica conversacional
-# ----------------------------------
-WELCOME = (
+GREETING = (
     "Gracias por contactarte con el área comercial de Veglienzone Gestión Inmobiliaria. "
     "¿Cómo podemos ayudarte hoy?\n"
     "1- Alquileres\n2- Ventas\n3- Tasaciones\n\n"
     "Nota: si en cualquier momento escribís *reset*, la conversación se reinicia desde cero."
 )
 
-ASK_ADDRESS = "¿Tenés dirección o link exacto de la propiedad, o estás averiguando por una zona/barrio?"
+SITE_LINK = "https://www.veglienzone.com.ar/"
 
-def make_vendor_message(chat_id: str, sess: Dict[str, Any]) -> str:
-    lines = [
-        "✅ *Lead calificado para derivación*",
-        f"• Cliente: {chat_id}",
+# ==========
+# App setup
+# ==========
+app = FastAPI(title="FastAPI Agent - Veglienzone")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==========
+# In-memory session (simple TTL)
+# ==========
+_SESS: Dict[str, Dict[str, Any]] = {}
+_TTL_SECONDS = 60 * 60 * 6  # 6 horas
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _get_sess(chat_id: str) -> Dict[str, Any]:
+    s = _SESS.get(chat_id)
+    if not s or (_now() - s.get("_ts", 0) > _TTL_SECONDS):
+        s = {
+            "_ts": _now(),
+            "stage": "start",              # start | asked_intent | waiting_area_or_address | show_property_asked_qualify | qualifying | after_qualified
+            "intention": None,             # alquiler | venta | tasaciones
+            "prop_id": None,               # id de propiedad en Tokko si se seleccionó una
+            "prop_brief": None,            # resumen de la ficha
+            "qualified": False,            # calificado o no
+        }
+        _SESS[chat_id] = s
+    else:
+        s["_ts"] = _now()
+    return s
+
+
+def _reset_sess(chat_id: str) -> Dict[str, Any]:
+    if chat_id in _SESS:
+        del _SESS[chat_id]
+    return _get_sess(chat_id)
+
+
+# ==========
+# Utils de texto
+# ==========
+def _strip_accents(s: str) -> str:
+    if not s:
+        return ""
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn").lower()
+
+
+def looks_like_no_address(text: str) -> bool:
+    """
+    Frases para 'no tengo dirección ni link' o 'estoy averiguando por zona/barrio'.
+    """
+    t = _strip_accents(text)
+    patterns = [
+        r"\bno tengo (direccion|link)\b",
+        r"\bno tengo\b",
+        r"\bno (tengo|poseo) (datos|info)\b",
+        r"\bsolo (zona|barrio)\b",
+        r"\b(estoy|ando) (averiguando|buscando) (por )?(zona|barrio)\b",
+        r"\bzona\b",
+        r"\bbarrio\b",
+        r"\bcentro\b",
     ]
-    if sess.get("op"):
-        lines.append(f"• Operación: {sess['op'].title()}")
-    if sess.get("exact"):
-        lines.append(f"• Propiedad: {sess['exact'].get('address','')}")
-        if sess['exact'].get('code'):
-            lines.append(f"• Código: {sess['exact']['code']}")
-        if sess['exact'].get('web_url'):
-            lines.append(f"• Link: {sess['exact']['web_url']}")
-    q = sess.get("qual", {})
-    if sess.get("op") == "alquiler":
-        lines.append(f"• Ingresos demostrables: {q.get('ingresos')}")
-        lines.append(f"• Garantía: {q.get('garantia')}")
-        lines.append(f"• Habitantes: {q.get('habitantes')}")
-        lines.append(f"• Mascotas: {q.get('mascotas')}")
-    return "\n".join(lines)
+    return any(re.search(p, t) for p in patterns) and not re.search(r"\d{2,5}", t)
 
 
-def handle_message(chat_id: str, msg: str) -> QualifyOut:
-    out = QualifyOut()
-    t = norm(msg)
+def detect_intention(text: str) -> Optional[str]:
+    t = _strip_accents(text)
+    if re.search(r"\b(alquiler|alquilar|rentar|alquilo)\b", t):
+        return "alquiler"
+    if re.search(r"\b(venta|vender|vendo)\b", t):
+        return "venta"
+    if re.search(r"\b(tasaci[oó]n|tasar|valuaci[oó]n)\b", t):
+        return "tasaciones"
+    return None
 
-    # reset
-    if t in {"reset", "/reset", "reiniciar"}:
-        reset_session(chat_id)
-        out.reply_text = WELCOME
-        return out
 
-    sess = session(chat_id)
+# ==========
+# Tokko helpers
+# ==========
+def _tokko_headers():
+    return {"X-Authorization": TOKKO_API_KEY} if TOKKO_API_KEY else {}
 
-    # Estado inicial
-    if sess["state"] == "welcome":
-        # detectar si ya aclaró la operación
-        op = extract_op(msg)
-        if op:
-            sess["op"] = op
-            sess["state"] = "ask_address"
-            out.reply_text = ASK_ADDRESS
-            return out
-        # aún no
-        out.reply_text = WELCOME
-        return out
 
-    # Selección de operación
-    if sess["state"] in {"ask_op", "ask_address"}:
-        # si todavía no definió operación
-        if not sess["op"]:
-            op = extract_op(msg)
-            if not op:
-                out.reply_text = WELCOME
-                sess["state"] = "welcome"
-                return out
-            sess["op"] = op
-            sess["state"] = "ask_address"
-            out.reply_text = ASK_ADDRESS
-            return out
+async def get_tokko_by_publication_code(code: str) -> Optional[dict]:
+    """
+    Busca ficha por código de publicación (el que aparece en /p/<code> del sitio)
+    """
+    if not code:
+        return None
+    url = "https://api.tokkobroker.com/api/v1/properties/"
+    params = {"publication_code": code, "limit": 1}
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params=params, headers=_tokko_headers())
+        if r.status_code == 200:
+            js = r.json()
+            if js.get("objects"):
+                return js["objects"][0]
+    return None
 
-        # ya tenemos op, ahora procesar dirección o zona
-        if said_no_address(msg):
-            # Sólo link y cierro cordialmente
-            out.reply_text = (
-                "Perfecto, te dejo el link donde están todas nuestras propiedades para que puedas ver si alguna te interesa:\n"
-                f"{SITE_LINK}\n\n"
-                "Cualquier consulta puntual, escribime por acá 🙌"
+
+async def get_tokko_by_url(full_url: str) -> Optional[dict]:
+    """
+    Fallback: intenta buscar por URL con 'search' (si Tokko lo indexa)
+    """
+    if not full_url:
+        return None
+    url = "https://api.tokkobroker.com/api/v1/properties/"
+    q = full_url.split("?")[0]
+    params = {"search": q, "limit": 1}
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(url, params=params, headers=_tokko_headers())
+        if r.status_code == 200:
+            js = r.json()
+            if js.get("objects"):
+                return js["objects"][0]
+    return None
+
+
+async def search_tokko_by_address(raw_text: str, op: Optional[str]) -> Optional[dict]:
+    """
+    Heurística por dirección con normalización y fuzzy.
+    """
+    text = raw_text.strip()
+    # elimina 'al', 'altura', etc
+    text_norm = _strip_accents(re.sub(r"\b(al|altura)\b", "", text, flags=re.I)).strip()
+
+    params = {"search": text_norm, "limit": 15}
+    if op == "alquiler":
+        params["operation"] = "rent"
+    elif op == "venta":
+        params["operation"] = "sale"
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get("https://api.tokkobroker.com/api/v1/properties/", params=params, headers=_tokko_headers())
+        if r.status_code != 200:
+            return None
+        data = r.json().get("objects", [])
+
+    if not data:
+        return None
+
+    best, best_score = None, 0.0
+    for p in data:
+        addr = _strip_accents(p.get("address") or p.get("display_address") or "")
+        score = SequenceMatcher(None, text_norm, addr).ratio()
+        if score > best_score:
+            best, best_score = p, score
+
+    return best if best_score >= 0.6 else None
+
+
+def render_property_card(p: dict) -> str:
+    title = p.get("title") or (p.get("property_type") or "Propiedad").title()
+    addr = p.get("address") or p.get("display_address") or "Dirección no disponible"
+    op = (p.get("operation") or "").capitalize()
+    price = p.get("price", "")
+    currency = p.get("currency", "")
+    price_str = f"{currency} {price}" if price and currency else (str(price) if price else "")
+    m2 = p.get("covered_surface")
+    rooms = p.get("rooms")
+    baths = p.get("bathrooms")
+    url = p.get("web_url") or p.get("permalink") or p.get("url") or SITE_LINK
+
+    parts = [
+        f"*{title}*",
+        f"📍 {addr}",
+        f"💼 {op}" if op else None,
+        f"💲 {price_str}" if price_str else None,
+        f"📏 {m2} m² cub." if m2 else None,
+        f"🛏️ {rooms} dorm." if rooms is not None else None,
+        f"🛁 {baths} baños" if baths is not None else None,
+        f"🔗 {url}",
+    ]
+    return "\n".join([x for x in parts if x])
+
+
+# ==========
+# Modelos de E/S
+# ==========
+class QualifyReq(BaseModel):
+    chatId: str = Field(..., description="ID de chat de WhatsApp (ej. 5493412...@c.us)")
+    message: str = Field(..., description="Texto del usuario (o link)")
+    isFromMe: Optional[bool] = False
+    senderName: Optional[str] = ""
+
+
+class QualifyResp(BaseModel):
+    reply_text: str
+    vendor_push: bool = False
+    vendor_message: str = ""
+    closing_text: str = ""
+
+
+# ==========
+# Handlers de intentos y estado
+# ==========
+def _menu() -> str:
+    return GREETING
+
+
+def _ask_area_or_address() -> str:
+    return "¿Tenés dirección o link exacto de la propiedad, o estás averiguando por una zona/barrio?"
+
+
+def _link_only_reply() -> str:
+    # solo link del sitio y cierre cordial
+    return (
+        "Perfecto. Te dejo el link donde están todas nuestras propiedades para que veas si alguna te interesa:\n"
+        f"{SITE_LINK}\n\n"
+        "Si necesitás algo puntual, escribime por acá."
+    )
+
+
+def _ask_qualify_prompt() -> str:
+    return (
+        "Para avanzar con esta unidad, ¿contás con *ingresos demostrables* que tripliquen el alquiler y "
+        "*garantía apta CABA* (Finaer / seguro de caución o propietaria)?"
+    )
+
+
+def _after_qualify_yes() -> str:
+    return "Genial, ¿querés que te contacte un asesor humano por este WhatsApp para coordinar? (sí/no)"
+
+
+def _after_qualify_no() -> str:
+    return (
+        "Entiendo. Si preferís, podés explorar el catálogo completo aquí:\n"
+        f"{SITE_LINK}\n\n"
+        "Quedo atento a cualquier consulta."
+    )
+
+
+def _cordial_close() -> str:
+    return "¡Gracias por escribirnos! Cualquier otra consulta, estoy a disposición."
+
+
+def _looks_yes(t: str) -> bool:
+    tt = _strip_accents(t)
+    return bool(re.search(r"\b(si|sí|dale|ok|de acuerdo|correcto)\b", tt))
+
+
+def _looks_no(t: str) -> bool:
+    tt = _strip_accents(t)
+    return bool(re.search(r"\b(no|nop|no gracias|prefiero que no)\b", tt))
+
+
+# ==========
+# Core routing
+# ==========
+async def handle_message(chat_id: str, text: str, sender: str) -> QualifyResp:
+    s = _get_sess(chat_id)
+    t = text.strip()
+
+    # Reset
+    if re.search(r"\breset\b", _strip_accents(t)):
+        _reset_sess(chat_id)
+        return QualifyResp(reply_text=_menu())
+
+    # 1) Si recién empieza o viene de reset → menú
+    if s["stage"] == "start":
+        s["stage"] = "asked_intent"
+        return QualifyResp(reply_text=_menu())
+
+    # 2) Si está eligiendo intención
+    if s["stage"] == "asked_intent":
+        intent = detect_intention(t)
+        if intent:
+            s["intention"] = intent
+            s["stage"] = "waiting_area_or_address"
+            return QualifyResp(reply_text=_ask_area_or_address())
+        else:
+            # si el usuario escribe algo tipo "busco alquilar", cae igual
+            intent = detect_intention(t)
+            if intent:
+                s["intention"] = intent
+                s["stage"] = "waiting_area_or_address"
+                return QualifyResp(reply_text=_ask_area_or_address())
+            # fallback: reenvía menú
+            return QualifyResp(reply_text=_menu())
+
+    # 3) Link explícito → resolver ficha exacta
+    url_match = re.search(r'https?://[^\s]+', t)
+    if url_match:
+        url = url_match.group(0)
+        prop = None
+        m = re.search(r'/p/(\d+)', url)
+        if "veglienzone.com.ar" in url and m:
+            prop = await get_tokko_by_publication_code(m.group(1))
+        if not prop:
+            prop = await get_tokko_by_url(url)
+
+        if prop:
+            brief = render_property_card(prop)
+            s["prop_id"] = prop.get("id")
+            s["prop_brief"] = brief
+            s["stage"] = "show_property_asked_qualify"
+            return QualifyResp(reply_text=brief + "\n\n" + _ask_qualify_prompt())
+
+        # si no matchea
+        return QualifyResp(
+            reply_text="No pude identificar la ficha a partir del link. ¿Podés confirmarme la *dirección exacta* o reenviarme el link completo?",
+        )
+
+    # 4) Si dice que no tiene dirección → sólo link del sitio
+    if looks_like_no_address(t):
+        # No modificamos intención; enviamos link y cerramos cordial
+        s["stage"] = "after_qualified"  # consideramos cerrado el tramo de búsqueda
+        return QualifyResp(reply_text=_link_only_reply())
+
+    # 5) ¿Parece dirección? (calle + número o 'al 2300')
+    maybe_addr = re.search(r'[A-Za-zÁÉÍÓÚÑáéíóúñ\.\s]+?\s+\d{2,5}', t) or \
+                 re.search(r'[A-Za-zÁÉÍÓÚÑáéíóúñ\.\s]+?\s+al\s+\d{3,5}', t, flags=re.I)
+
+    if s["stage"] in ("waiting_area_or_address", "asked_intent") and maybe_addr:
+        prop = await search_tokko_by_address(t, s.get("intention"))
+        if prop:
+            brief = render_property_card(prop)
+            s["prop_id"] = prop.get("id")
+            s["prop_brief"] = brief
+            s["stage"] = "show_property_asked_qualify"
+            return QualifyResp(reply_text=brief + "\n\n" + _ask_qualify_prompt())
+        else:
+            return QualifyResp(
+                reply_text="No encuentro esa dirección todavía. ¿Podés confirmarme *calle y altura* (ej.: *Av. Cabildo 2853*) o mandarme el link de la ficha?",
             )
-            out.closing_text = ""
-            sess["state"] = "welcome"  # volvemos al inicio para una próxima consulta
-            return out
 
-        if looks_like_url(msg) or looks_like_address(msg):
-            # Buscar en Tokko
-            candidates = tokko_search_by_address(msg)
-            sess["tokko_hits"] = candidates
-            exact = tokko_exact_match(msg, candidates)
-            if exact:
-                sess["exact"] = exact
-                # Mostrar SOLO esa ficha
-                out.reply_text = property_summary(exact)
-                # Iniciar calificación si es alquiler
-                if sess["op"] == "alquiler":
-                    sess["state"] = "q_ingresos"
-                    out.closing_text = "Para avanzar con alquiler, ¿contás con *ingresos demostrables*?"
-                else:
-                    # Venta: no pedimos requisitos duros, vamos directo a consulta/derivación
-                    sess["state"] = "ask_deriv"
-                    out.closing_text = "¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
-                return out
-            else:
-                # Listar hasta 3 alternativas
-                if not candidates:
-                    out.reply_text = (
-                        "No encontré coincidencias exactas para esa dirección. "
-                        "Si querés, mirá nuestro catálogo completo:\n"
-                        f"{SITE_LINK}\n\n"
-                        "¿Querés decirme otra dirección o barrio?"
-                    )
-                    sess["state"] = "ask_address"
-                    return out
-                out.reply_text = "Estas son las coincidencias más cercanas:\n" + list_summary(candidates)
-                out.closing_text = (
-                    "Si alguna te interesa, decime cuál (1, 2 o 3), o compartime el link/código exacto."
+    # 6) Si ya mostramos una ficha y estamos pidiendo calificar
+    if s["stage"] == "show_property_asked_qualify":
+        # Si responde que SÍ tiene ingresos + garantía, pasamos a preguntar derivación
+        # Aceptamos respuestas libres; si sólo pone "sí", lo tomamos como OK
+        if _looks_yes(t) or re.search(r"(ingreso|recibo|monotrib|sueldo).*(garant|finaer|cauci[oó]n|propietaria)", _strip_accents(t)):
+            s["qualified"] = True
+            s["stage"] = "after_qualified"
+            return QualifyResp(reply_text=_after_qualify_yes())
+        # Si dice que NO
+        if _looks_no(t):
+            s["qualified"] = False
+            s["stage"] = "after_qualified"
+            return QualifyResp(reply_text=_after_qualify_no())
+        # Si escribe algo ambiguo, repreguntamos
+        return QualifyResp(
+            reply_text="¿Contás con *ingresos demostrables* que tripliquen el alquiler y *garantía apta CABA* (Finaer / seguro de caución o propietaria)? (sí/no)"
+        )
+
+    # 7) Después de calificar: ofrecer derivar si está calificado
+    if s["stage"] == "after_qualified":
+        if s.get("qualified"):
+            if _looks_yes(t):
+                # Acá recién empujamos al asesor humano: vendor_push = True
+                vendor_msg = f"Nuevo lead calificado desde WhatsApp.\n\nCliente: {sender}\nChatId: {chat_id}\nIntención: {s.get('intention')}\n\n{(s.get('prop_brief') or '')}"
+                # No respondemos nada extraño al cliente, solo confirmamos:
+                return QualifyResp(
+                    reply_text="Perfecto, te va a escribir un asesor por acá. ¡Gracias!",
+                    vendor_push=True,
+                    vendor_message=vendor_msg
                 )
-                sess["state"] = "pick_from_list"
-                return out
+            if _looks_no(t):
+                return QualifyResp(reply_text=_cordial_close())
+            # sino, repregunta cortés
+            return QualifyResp(reply_text="¿Querés que te contacte un asesor humano por este WhatsApp? (sí/no)")
+        else:
+            # no calificado → cierre cordial
+            return QualifyResp(reply_text=_cordial_close())
 
-        # Si llegó texto genérico (por zona/barrio pero sin “no tengo dirección”)
-        if any(w in t for w in ["zona", "barrio", "centro", "norte", "sur", "oeste", "este"]):
-            out.reply_text = (
-                "Perfecto, te dejo el link donde están todas nuestras propiedades para que puedas ver si alguna te interesa:\n"
-                f"{SITE_LINK}\n\n"
-                "Cualquier consulta puntual, escribime por acá 🙌"
-            )
-            sess["state"] = "welcome"
-            return out
+    # 8) Fallbacks: si todavía no elegimos intención, forzamos menú
+    if not s.get("intention"):
+        s["stage"] = "asked_intent"
+        return QualifyResp(reply_text=_menu())
 
-        # No entendí → repreguntar
-        out.reply_text = ASK_ADDRESS
-        return out
+    # Si estaba esperando área/dirección pero no entiendo: repregunto
+    if s["stage"] == "waiting_area_or_address":
+        return QualifyResp(reply_text=_ask_area_or_address())
 
-    # Selección desde listado (1-3)
-    if sess["state"] == "pick_from_list":
-        m = re.search(r"\b([1-3])\b", t)
-        if not m:
-            out.reply_text = "Decime 1, 2 o 3 para ver la ficha completa; o pasame el link/código exacto."
-            return out
-        idx = int(m.group(1)) - 1
-        hits = sess.get("tokko_hits") or []
-        if 0 <= idx < len(hits):
-            exact = hits[idx]
-            sess["exact"] = exact
-            out.reply_text = property_summary(exact)
-            if sess["op"] == "alquiler":
-                sess["state"] = "q_ingresos"
-                out.closing_text = "Para avanzar con alquiler, ¿contás con *ingresos demostrables*?"
-            else:
-                sess["state"] = "ask_deriv"
-                out.closing_text = "¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
-            return out
-        out.reply_text = "Número inválido. Elegí 1, 2 o 3; o pasame el link/código exacto."
-        return out
+    # Caso general
+    return QualifyResp(reply_text="Perdón, estoy con un inconveniente técnico. ¿Podés repetir tu consulta?")
 
-    # Calificación para ALQUILER
-    if sess["state"] == "q_ingresos":
-        sess["qual"]["ingresos"] = "sí" if is_yes(msg) else ("no" if is_no(msg) else msg)
-        sess["state"] = "q_garantia"
-        out.reply_text = "¿Qué *tipo de garantía* podrías presentar? (Finaer/Seguro de caución, propietaria CABA, u otra)"
-        return out
-
-    if sess["state"] == "q_garantia":
-        sess["qual"]["garantia"] = msg.strip()
-        sess["state"] = "q_habitantes"
-        out.reply_text = "¿Cuántas *personas* vivirían en la unidad?"
-        return out
-
-    if sess["state"] == "q_habitantes":
-        sess["qual"]["habitantes"] = msg.strip()
-        sess["state"] = "q_mascotas"
-        out.reply_text = "¿Tienen *mascotas*? (sí/no y cuáles)"
-        return out
-
-    if sess["state"] == "q_mascotas":
-        sess["qual"]["mascotas"] = msg.strip()
-        sess["state"] = "ask_deriv"
-        out.reply_text = "¡Gracias! Con esos datos puedo ayudarte mejor."
-        out.closing_text = "¿Querés que te contacte un asesor humano por este WhatsApp para coordinar?"
-        return out
-
-    # Pregunta final de derivación
-    if sess["state"] == "ask_deriv":
-        if is_yes(msg):
-            out.vendor_push = True
-            out.vendor_message = make_vendor_message(chat_id, sess)
-            out.reply_text = "¡Genial! Ya aviso a un asesor para que te contacte por este WhatsApp 👇"
-            out.closing_text = ""
-            # luego de derivar, reseteamos al estado inicial
-            sess["state"] = "welcome"
-            return out
-        if is_no(msg):
-            out.reply_text = "Perfecto, quedo atento a tus consultas sobre la propiedad. ¡Gracias por escribirnos! 🙂"
-            sess["state"] = "welcome"
-            return out
-        out.reply_text = "¿Te derivo con un asesor por este WhatsApp? (sí/no)"
-        return out
-
-    # Fallback
-    out.reply_text = "Perdón, estoy con un inconveniente técnico. ¿Podés repetir tu consulta?"
-    return out
-
-
-# ----------------------------------
-# Endpoints
-# ----------------------------------
+# ==========
+# API
+# ==========
 @app.get("/health")
-def health():
-    return {"ok": True, "llm_mode": "openai", "OPENAI_MODEL": OPENAI_MODEL}
+async def health():
+    return {"ok": True}
 
+@app.get("/debug")
+async def debug():
+    # Info básica (ocultando secretos)
+    env = {
+        "TOKKO_API_KEY": "****" if TOKKO_API_KEY else "(missing)",
+    }
+    return {"env": env}
 
-@app.post("/qualify", response_model=QualifyOut)
-def qualify(payload: QualifyIn = Body(...)):
+@app.post("/qualify", response_model=QualifyResp)
+async def qualify(payload: QualifyReq = Body(...)):
     """
-    Punto que usa tu nodo HTTP "Qualify" en n8n.
+    Entrada desde n8n:
+      - chatId
+      - message (puede ser texto o link)
+      - isFromMe (ignorado)
+      - senderName
     """
-    log.info("QUALIFY IN <- %s", payload.dict())
-    out = handle_message(payload.chatId, payload.message)
-    log.info("QUALIFY OUT -> %s", out.dict())
-    return out
+    if not payload.chatId or not payload.message:
+        return QualifyResp(reply_text="Perdón, llegó un mensaje vacío. ¿Podés repetir?")
 
-
-# (Opcional) endpoint legacy por si tenés hooks antiguos apuntando acá
-@app.post("/api/inbound", response_model=QualifyOut)
-def qualify_legacy(payload: QualifyIn = Body(...)):
-    return qualify(payload)
+    resp = await handle_message(
+        chat_id=payload.chatId,
+        text=payload.message,
+        sender=payload.senderName or ""
+    )
+    return resp
