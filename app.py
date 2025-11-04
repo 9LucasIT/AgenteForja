@@ -9,12 +9,29 @@ import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+# --- NEW: DB ---
+from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
+
 # ─────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # reservado p/ futuro
 TOKKO_API_KEY = os.getenv("TOKKO_API_KEY", "").strip()
-SITE_URL = os.getenv("SITE_URL", "https://www.veglienzone.com.ar/")
+SITE_URL = os.getenv("SITE_URL", "https://www.veglienzone.com.ar/").rstrip("/")
+
+# NEW: conexión DB (Railway) - opcional
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+engine: Optional[Engine] = None
+if DATABASE_URL:
+    try:
+        engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+        with engine.connect() as c:
+            c.execute(text("SELECT 1"))
+        print("DB: conexión OK")
+    except Exception as e:
+        print(f"DB: no disponible: {e}")
+        engine = None
 
 # Nota: mantenemos memoria simple en RAM por chatId
 STATE: Dict[str, Dict[str, Any]] = {}
@@ -207,6 +224,65 @@ async def search_tokko_by_address(raw_text: str) -> Optional[dict]:
 
 
 # ─────────────────────────────────────────────────────────────
+# NEW: Fallback a base local (Railway) por dirección
+# ─────────────────────────────────────────────────────────────
+def _fetch_local_by_address(addr: str, operacion: Optional[str]) -> Optional[dict]:
+    """
+    Busca en tabla `propiedades` por dirección (LIKE) y opcionalmente por operación ('alquiler'/'venta').
+    Espera columnas: codigo_ref, direccion, operacion, moneda, precio, link, surface_cubierta, dormitorios, banos, ambientes
+    """
+    if not engine or not addr:
+        return None
+    try:
+        like = f"%{addr.strip()}%"
+        if operacion in ("alquiler", "venta"):
+            q = text(
+                "SELECT codigo_ref, direccion, operacion, moneda, precio, link, "
+                "surface_cubierta, dormitorios, banos, ambientes "
+                "FROM propiedades "
+                "WHERE activa=1 AND operacion=:op AND direccion LIKE :dir "
+                "ORDER BY updated_at DESC LIMIT 1"
+            )
+            row = engine.execute(q, {"op": operacion, "dir": like}).fetchone()
+        else:
+            q = text(
+                "SELECT codigo_ref, direccion, operacion, moneda, precio, link, "
+                "surface_cubierta, dormitorios, banos, ambientes "
+                "FROM propiedades "
+                "WHERE activa=1 AND direccion LIKE :dir "
+                "ORDER BY updated_at DESC LIMIT 1"
+            )
+            row = engine.execute(q, {"dir": like}).fetchone()
+
+        if not row:
+            return None
+
+        (codigo_ref, direccion, op, moneda, precio, link, sup, dorms, banos, amb) = row
+        price_lbl = None
+        if precio is not None:
+            try:
+                price_lbl = f"{moneda or ''} {float(precio):,.0f}".replace(",", ".")
+            except Exception:
+                price_lbl = f"{moneda or ''} {precio}"
+
+        return {
+            "title": f"Ref. {codigo_ref}" if codigo_ref else "Propiedad",
+            "address": direccion or "",
+            "operation": (op or "").capitalize(),
+            "price": price_lbl,
+            "surface_covered": sup or 0,
+            "bedrooms": dorms or 0,
+            "bathrooms": banos or 0,
+            "rooms": amb or 0,
+            "web_url": link or SITE_URL,
+            "code": codigo_ref or "",
+        }
+    except Exception as e:
+        print(f"Local DB lookup error: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────
 # Render de ficha breve
 # ─────────────────────────────────────────────────────────────
 def _fmt_money(v) -> str:
@@ -224,7 +300,8 @@ def _fmt_money(v) -> str:
 def render_property_card(p: dict) -> str:
     title = p.get("title") or p.get("operation") or "Propiedad"
     addr = p.get("address") or p.get("display_address") or "Sin dirección"
-    op = (p.get("operation") or "").capitalize()
+    op = (p.get("operation") or p.get("operations", [{}])[0].get("operation_type") if isinstance(p.get("operations"), list) else p.get("operation")) or ""
+    op = (op or "").capitalize()
     price = p.get("price") or p.get("price_operation") or p.get("price_from") or p.get("price_usd")
     price_txt = _fmt_money(price)
     m2 = p.get("surface_covered") or p.get("surface_total") or 0
@@ -305,6 +382,12 @@ def _is_zone_search(t: str) -> bool:
     return any(re.search(p, nt) for p in patterns)
 
 
+def _looks_like_address(t: str) -> bool:
+    nt = _strip_accents(t)
+    return bool(re.search(r"\b(av|avenida|calle|pasaje|pje|ruta|camino|cabildo|santa fe|humboldt|yatay|moreno)\b", nt)) \
+           and bool(re.search(r"\b\d{2,5}\b", nt))
+
+
 # ─────────────────────────────────────────────────────────────
 # Ruta principal usada por n8n (Webhook → Qualify)
 # ─────────────────────────────────────────────────────────────
@@ -340,6 +423,8 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
     # ── stage: ask_zone_or_address
     if stage == "ask_zone_or_address":
+        intent = s.get("intent", "alquiler")
+
         # Si es consulta por zona/barrio → enviar link del sitio y cerrar
         if _is_zone_search(text):
             s["stage"] = "done"
@@ -359,26 +444,52 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             prop = await get_tokko_by_reference_code(clues["reference_code"])
         if not prop and clues["url"]:
             prop = await get_tokko_by_url(clues["url"])
-        if not prop:
-            # intentar por dirección
+        if not prop and _looks_like_address(text):
+            # NEW: fallback a tu base local si Tokko no devolvió nada
+            prop = _fetch_local_by_address(text, "alquiler" if intent == "alquiler" else "venta") or _fetch_local_by_address(text, None)
+        if not prop and not clues["url"]:
+            # intentar por dirección general en Tokko
             prop = await search_tokko_by_address(text)
 
         if prop:
             brief = render_property_card(prop)
             s["prop_id"] = prop.get("id")
             s["prop_brief"] = brief
-            s["stage"] = "show_property_asked_qualify"
-            return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt())
+
+            if intent == "alquiler":
+                s["stage"] = "show_property_asked_qualify"
+                return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt())
+
+            if intent == "venta":
+                s["stage"] = "venta_visit"
+                return QualifyOut(
+                    reply_text=brief + "\n\n¿Querés coordinar una *visita* o que un *asesor* te contacte para más detalles?"
+                )
+
+            if intent == "tasacion":
+                s["stage"] = "tasacion_detalle"
+                return QualifyOut(
+                    reply_text=brief + "\n\nPara la *tasación*, contame: tipo de propiedad (casa/departamento/cochera), "
+                                       "antigüedad aproximada y estado general."
+                )
 
         # No hubo match
-        return QualifyOut(
-            reply_text=(
-                "No pude identificar la ficha a partir del texto. "
-                "¿Podés confirmarme la *dirección exacta* o reenviarme el *link* completo?"
+        if intent == "alquiler":
+            return QualifyOut(
+                reply_text=("No pude identificar la ficha a partir del texto. "
+                            "¿Podés confirmarme la *dirección exacta* o reenviarme el *link* completo?")
             )
+        if intent == "venta":
+            return QualifyOut(
+                reply_text=("No ubico esa ficha puntual. Si querés, contame *zona/barrio* y *presupuesto* para mostrarte opciones, "
+                            "o pasame el *link* de la publicación.")
+            )
+        # tasación
+        return QualifyOut(
+            reply_text=("Para tasar necesito la *dirección exacta* y tipo de propiedad. Si tenés el link de la ficha, mejor 😉")
         )
 
-    # ── stage: show_property_asked_qualify → evaluar requisitos y derivar
+    # ── stage: show_property_asked_qualify → (ALQUILER) evaluar requisitos y derivar
     if stage == "show_property_asked_qualify":
         nt = _strip_accents(text)
         has_income = bool(re.search(r"(ingreso|recibo|demostrable|monotrib|dependencia)", nt))
@@ -386,14 +497,14 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
         # si dice NO explícito a requisitos
         if _is_no(text):
-            s["stage"] = "done"
+            STATE[chat_id]["stage"] = "done"
             return QualifyOut(
                 reply_text="Entiendo. Si en otro momento contás con los requisitos, ¡escribinos por acá!",
                 closing_text=_farewell(),
             )
 
         if has_income and has_guarantee:
-            s["stage"] = "ask_handover"
+            STATE[chat_id]["stage"] = "ask_handover"
             return QualifyOut(
                 reply_text=(
                     "¡Genial! Con esos datos podés calificar. "
@@ -409,12 +520,11 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             )
         )
 
-    # ── stage: ask_handover
+    # ── stage: ask_handover (ALQUILER)
     if stage == "ask_handover":
         if _is_yes(text):
-            s["stage"] = "done"
-            # Vendor handoff: el mensaje al vendedor puede incluir la ficha resumida
-            vendor_msg = f"Lead calificado desde WhatsApp.\nChat: {chat_id}\n{ s.get('prop_brief','') }"
+            STATE[chat_id]["stage"] = "done"
+            vendor_msg = f"Lead calificado desde WhatsApp.\nChat: {chat_id}\n{ STATE[chat_id].get('prop_brief','') }"
             return QualifyOut(
                 reply_text="Perfecto, te derivo con un asesor humano que te contactará por acá. ¡Gracias!",
                 vendor_push=True,
@@ -422,13 +532,48 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 closing_text=_farewell(),
             )
         if _is_no(text):
-            s["stage"] = "done"
+            STATE[chat_id]["stage"] = "done"
             return QualifyOut(
                 reply_text="¡Sin problema! Si más adelante querés avanzar, escribinos por acá.",
                 closing_text=_farewell(),
             )
-        # respuesta ambigua → repregunta
         return QualifyOut(reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? (sí/no)")
+
+    # ── stage: venta_visit (VENTAS)
+    if stage == "venta_visit":
+        if _is_yes(text):
+            STATE[chat_id]["stage"] = "done"
+            vendor_msg = f"Lead *VENTA* desde WhatsApp.\nChat: {chat_id}\n{ STATE[chat_id].get('prop_brief','') }"
+            return QualifyOut(
+                reply_text="¡Genial! Te contacto un asesor por este WhatsApp para coordinar visita y detalles.",
+                vendor_push=True,
+                vendor_message=vendor_msg,
+                closing_text=_farewell(),
+            )
+        if _is_no(text):
+            STATE[chat_id]["stage"] = "done"
+            return QualifyOut(
+                reply_text="¡Perfecto! Cualquier duda o si querés coordinar más adelante, escribinos por acá.",
+                closing_text=_farewell(),
+            )
+        return QualifyOut(reply_text="¿Coordinamos *visita* o preferís que un *asesor* te escriba? (sí/no)")
+
+    # ── stage: tasacion_detalle (TASACIONES)
+    if stage == "tasacion_detalle":
+        # con cualquier respuesta, derivamos al asesor con el detalle capturado
+        STATE[chat_id]["stage"] = "done"
+        vendor_msg = (
+            "Lead *TASACIÓN* desde WhatsApp.\n"
+            f"Chat: {chat_id}\n"
+            f"Detalle brindado por el cliente: {text}\n"
+            f"{STATE[chat_id].get('prop_brief','')}"
+        )
+        return QualifyOut(
+            reply_text="Gracias. Con esos datos un asesor se pondrá en contacto para avanzar con la tasación.",
+            vendor_push=True,
+            vendor_message=vendor_msg,
+            closing_text=_farewell(),
+        )
 
     # ── stage: done (o desconocido) → menú
     _reset(chat_id)
@@ -446,11 +591,21 @@ def health():
 @app.get("/debug")
 def debug():
     # Ojo: no exponemos API keys
+    db_ok = False
+    try:
+        if engine:
+            with engine.connect() as c:
+                c.execute(text("SELECT 1"))
+            db_ok = True
+    except Exception:
+        db_ok = False
+
     return {
         "OPENAI_MODEL": OPENAI_MODEL,
         "TOKKO_API_KEY_set": bool(TOKKO_API_KEY),
         "SITE_URL": SITE_URL,
         "memory_sessions": len(STATE),
+        "db_ok": db_ok,
     }
 
 
