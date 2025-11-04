@@ -496,3 +496,43 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             if has_guarantee and not has_income:
                 s["last_prompt"] = "need_income"
                 return
+
+    
+
+    # --- CONTACTO CON ASESOR (etapa siguiente) ---
+    if stage == "ask_handover":
+        # Si responde que SÍ → se deriva al asesor humano
+        if _is_yes(text):
+            s["stage"] = "done"
+            s.pop("last_prompt", None)
+            vendor_msg = f"Lead calificado desde WhatsApp.\nChat: {chat_id}\n{ s.get('prop_brief','') }"
+            return QualifyOut(
+                reply_text=(
+                    "¡Genial! Te derivo con un asesor humano que te contactará por acá. ¡Gracias!"
+                ),
+                vendor_push=True,
+                vendor_message=vendor_msg,
+                closing_text=_farewell(),
+            )
+
+        # Si responde que NO → cierra conversación amablemente sin romper flujo
+        if _is_no(text):
+            s["stage"] = "done"
+            s.pop("last_prompt", None)
+            return QualifyOut(
+                reply_text=(
+                    "¡Gracias por tu consulta! Quedamos a disposición por cualquier otra duda. "
+                    "Cuando quieras, escribime de nuevo y arrancamos desde cero."
+                ),
+                vendor_push=False,
+                vendor_message="",
+                closing_text=_farewell(),
+            )
+
+        # Si responde algo ambiguo → repregunta
+        return QualifyOut(
+            reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? (sí/no)",
+            vendor_push=False,
+            vendor_message=""
+        )
+
