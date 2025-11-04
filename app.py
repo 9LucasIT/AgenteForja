@@ -6,7 +6,7 @@ from difflib import SequenceMatcher
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 
-import httpx  # queda por compatibilidad del proyecto
+import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -228,6 +228,19 @@ def _fmt_money(v) -> str:
         return "Consultar"
 
 
+def _has_price(v) -> bool:
+    try:
+        if v is None:
+            return False
+        s = str(v).strip()
+        if s == "" or s.lower() in {"null", "none"}:
+            return False
+        f = float(s)
+        return f > 0
+    except Exception:
+        return False
+
+
 def render_property_card_db(row: dict, intent: str) -> str:
     addr = row.get("direccion") or "Sin dirección"
     zona = row.get("zona") or "—"
@@ -239,12 +252,25 @@ def render_property_card_db(row: dict, intent: str) -> str:
     coch_txt = "Sí" if coch in {"1", "si", "sí", "true", "t", "y"} else "No"
     m2 = _to_int(row.get("total_construido"))
 
-    if intent == "alquiler":
-        price_txt = _fmt_money(row.get("precio_alquiler"))
-        op = "Alquiler"
-    else:
-        price_txt = _fmt_money(row.get("precio_venta"))
+    has_venta = _has_price(row.get("precio_venta"))
+    has_alq = _has_price(row.get("precio_alquiler"))
+
+    if has_venta and has_alq:
+        if intent == "alquiler":
+            op = "Alquiler"
+            price_txt = _fmt_money(row.get("precio_alquiler"))
+        else:
+            op = "Venta"
+            price_txt = _fmt_money(row.get("precio_venta"))
+    elif has_venta:
         op = "Venta"
+        price_txt = _fmt_money(row.get("precio_venta"))
+    elif has_alq:
+        op = "Alquiler"
+        price_txt = _fmt_money(row.get("precio_alquiler"))
+    else:
+        op = "—"
+        price_txt = "Consultar"
 
     cod = row.get("id") or "—"
 
@@ -376,7 +402,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             closing_text=_farewell(),
         )
 
-    # --- PIDE DIRECCIÓN ---
+    # --- DIRECCIÓN ---
     if stage == "ask_zone_or_address":
         if _is_zone_search(text):
             s["stage"] = "done"
@@ -395,14 +421,12 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             s["prop_row"] = row
             s["prop_brief"] = brief
             s["stage"] = "show_property_asked_qualify"
-            s["last_prompt"] = "qual_requirements"  # para interpretar un “sí” luego
+            s["last_prompt"] = "qual_requirements"
             return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt(intent))
 
         return QualifyOut(
-            reply_text=(
-                "No pude identificar la ficha a partir del texto. "
-                "¿Podés confirmarme la *dirección exacta* tal como figura en la publicación?"
-            )
+            reply_text=("No pude identificar la ficha a partir del texto. "
+                        "¿Podés confirmarme la *dirección exacta* tal como figura en la publicación?")
         )
 
     # --- CALIFICACIÓN ---
@@ -410,7 +434,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         intent = s.get("intent", "alquiler")
         nt = _strip_accents(text)
 
-        # Si viene un “sí” justo después de la pregunta de requisitos, interpretamos que califica
         if s.get("last_prompt") == "qual_requirements" and _is_yes(text):
             s["stage"] = "ask_handover"
             s.pop("last_prompt", None)
@@ -438,7 +461,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                                 "¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
                 )
 
-            # si solo dijo que tiene ingresos, guardamos parcial y repreguntamos por garantía
             if has_income and not has_guarantee:
                 s["last_prompt"] = "need_guarantee"
                 return QualifyOut(
@@ -446,84 +468,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                                 "(caución *FINAER*, *propietario* o *garantía propietaria*)")
                 )
 
-            # si solo dijo algo de garantía, pedimos ingresos
             if has_guarantee and not has_income:
                 s["last_prompt"] = "need_income"
-                return QualifyOut(
-                    reply_text=("Perfecto con la garantía. ¿Tenés *ingresos demostrables* que tripliquen el costo?")
-                )
-
-            # repregunta general si no entendimos
-            s["last_prompt"] = "qual_requirements"
-            return QualifyOut(
-                reply_text=(
-                    "Para avanzar necesito confirmar: ¿tenés *ingresos demostrables* que tripliquen el costo y alguna "
-                    "*garantía* (caución FINAER / propietario / garantía propietaria)? Respondé *sí* o contame qué te falta."
-                )
-            )
-
-        # VENTA
-        if intent == "venta":
-            if _is_no(text):
-                s["stage"] = "done"
-                return QualifyOut(
-                    reply_text="Perfecto, si necesitás ver otras opciones o comparar, escribime por acá.",
-                    closing_text=_farewell(),
-                )
-
-            talked_money = bool(re.search(r"(contado|financ|credito|hipoteca|se.na|reserva|oferta)", nt))
-            if talked_money or _is_yes(text):
-                s["stage"] = "ask_handover"
-                return QualifyOut(
-                    reply_text=("Gracias por la info. ¿Querés que te contacte un asesor para coordinar visita "
-                                "y conversar condiciones de compra?")
-                )
-
-            return QualifyOut(
-                reply_text=("¿La operación sería *contado* o *financiado*? ¿Tenés prevista *seña* o *reserva*?")
-            )
-
-    # --- DERIVACIÓN ---
-    if stage == "ask_handover":
-        if _is_yes(text):
-            s["stage"] = "done"
-            vendor_msg = f"Lead calificado desde WhatsApp.\nChat: {chat_id}\n{ s.get('prop_brief','') }"
-            return QualifyOut(
-                reply_text="Perfecto, te derivo con un asesor humano que te contactará por acá. ¡Gracias!",
-                vendor_push=True,
-                vendor_message=vendor_msg,
-                closing_text=_farewell(),
-            )
-        if _is_no(text):
-            s["stage"] = "done"
-            return QualifyOut(
-                reply_text="¡Sin problema! Si más adelante querés avanzar, escribinos por acá.",
-                closing_text=_farewell(),
-            )
-        return QualifyOut(reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? (sí/no)")
-
-    _reset(chat_id)
-    return QualifyOut(reply_text=_say_menu())
-
-
-# =============== Health / Debug ===============
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
-@app.get("/debug")
-def debug():
-    params = _db_params()
-    return {
-        "db_driver_available": PYM_AVAILABLE,
-        "db_host_set": bool(params.get("host")),
-        "db_name": params.get("database"),
-        "table": MYSQL_TABLE,
-        "memory_sessions": len(STATE),
-    }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+                return
