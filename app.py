@@ -509,26 +509,35 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                             "Respondé *sí* o contame qué te falta.")
             )
 
-        # Para ventas (o cualquier otro intent), mantenemos la misma lógica simple:
-        if _is_yes(text):
-            s["stage"] = "ask_handover"
-            s.pop("last_prompt", None)
+                # --- VENTAS ---
+        if intent == "venta":
+            # Detectamos forma de pago o mención de seña/reserva (incluye negativas: "sin seña", "no tengo seña")
+            has_payment = bool(re.search(r"\b(contado|financiad[oa])\b", nt))
+            mentions_seal = bool(re.search(r"\b(se[ñn]a|reserva)\b", nt))
+            neg_seal = bool(re.search(r"\b(sin|no tengo)\s+(se[ñn]a|reserva)\b", nt))
+
+            # Si respondió algo relevante (cualquiera de las 3), pasamos a la derivación
+            if has_payment or mentions_seal or neg_seal:
+                s["stage"] = "ask_handover"
+                s.pop("last_prompt", None)
+                return QualifyOut(
+                    reply_text=("¡Genial! ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
+                )
+
+            # Si dijo NO a secas, interpretamos como “sin seña / sin reserva” y también avanzamos
+            if _is_no(text):
+                s["stage"] = "ask_handover"
+                s.pop("last_prompt", None)
+                return QualifyOut(
+                    reply_text=("Perfecto. ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
+                )
+
+            # Respuesta ambigua → repreguntamos una sola vez (evita el loop)
+            s["last_prompt"] = "sales_q"
             return QualifyOut(
-                reply_text=("¡Genial! ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
+                reply_text=("¿La operación sería *contado* o *financiado*? ¿Tenés prevista alguna *seña* o *reserva*?")
             )
 
-        if _is_no(text):
-            s["stage"] = "done"
-            return QualifyOut(
-                reply_text=("Entiendo. ¡Gracias por la consulta! Si querés retomar en otro momento, enviá *reset*."),
-                closing_text=_farewell(),
-            )
-
-        # Si es ambiguo en ventas → repreguntamos
-        s["last_prompt"] = "qual_requirements"
-        return QualifyOut(
-            reply_text=("¿La operación sería *contado* o *financiado*? ¿Tenés prevista alguna *seña* o *reserva*?")
-        )
 
     # --- CONTACTO CON ASESOR (etapa siguiente) ---
     if stage == "ask_handover":
