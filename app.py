@@ -455,10 +455,12 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         )
 
     # --- CALIFICACIÓN ---
+        # --- CALIFICACIÓN ---
     if stage == "show_property_asked_qualify":
         intent = s.get("intent", "alquiler")
         nt = _strip_accents(text)
 
+        # Si viene un "sí" directo luego de la ficha (ej: "sí tengo", "sí cuento con todo")
         if s.get("last_prompt") == "qual_requirements" and _is_yes(text):
             s["stage"] = "ask_handover"
             s.pop("last_prompt", None)
@@ -470,7 +472,9 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         if intent == "alquiler":
             has_income = bool(re.search(r"(ingreso|recibo|demostrable|monotrib|dependencia)", nt))
             has_guarantee = bool(re.search(r"(garantia|garant[ií]a|caucion|propietari[ao]|finaer)", nt))
+            said_yes = _is_yes(text)
 
+            # si dice NO explícito a los requisitos
             if _is_no(text):
                 s["stage"] = "done"
                 return QualifyOut(
@@ -478,7 +482,8 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                     closing_text=_farewell(),
                 )
 
-            if has_income and has_guarantee:
+            # si dice SÍ o menciona ambos requisitos o una frase positiva
+            if said_yes or (has_income and has_guarantee) or "todo" in nt:
                 s["stage"] = "ask_handover"
                 s.pop("last_prompt", None)
                 return QualifyOut(
@@ -486,6 +491,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                                 "¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
                 )
 
+            # tiene ingresos pero no garantía
             if has_income and not has_guarantee:
                 s["last_prompt"] = "need_guarantee"
                 return QualifyOut(
@@ -493,9 +499,22 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                                 "(caución *FINAER*, *propietario* o *garantía propietaria*)")
                 )
 
+            # tiene garantía pero no ingresos
             if has_guarantee and not has_income:
                 s["last_prompt"] = "need_income"
-                return
+                return QualifyOut(
+                    reply_text=("Bien con la garantía. ¿Podrías confirmarme si tenés *ingresos demostrables* "
+                                "que tripliquen el valor del alquiler?")
+                )
+
+            # respuesta ambigua: repregunta
+            s["last_prompt"] = "qual_requirements"
+            return QualifyOut(
+                reply_text=("Para avanzar necesito confirmar: ¿tenés *ingresos demostrables* que tripliquen el costo "
+                            "y alguna *garantía* (caución FINAER / propietario / garantía propietaria)? "
+                            "Respondé *sí* o contame qué te falta.")
+            )
+
 
     
 
