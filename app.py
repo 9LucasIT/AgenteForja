@@ -6,24 +6,31 @@ from difflib import SequenceMatcher
 from typing import Optional, Dict, Any, List
 from urllib.parse import urlparse
 
-import mysql.connector
-from mysql.connector.connection import MySQLConnection
+import httpx  # queda por compatibilidad del proyecto
 from fastapi import FastAPI
 from pydantic import BaseModel
-from starlette.concurrency import run_in_threadpool
 
 # ─────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────
 SITE_URL = os.getenv("SITE_URL", "https://www.veglienzone.com.ar/").strip()
 
-# Estado muy simple en memoria por chatId
+# Preferencia: DATABASE_URL (mysql+pymysql://user:pass@host:port/db)
+DATABASE_URL = os.getenv("DATABASE_URL", "") or os.getenv("MYSQL_URL", "")
+MYSQL_HOST = os.getenv("MYSQLHOST") or os.getenv("MYSQL_HOST")
+MYSQL_PORT = int(os.getenv("MYSQLPORT") or os.getenv("MYSQL_PORT") or "3306")
+MYSQL_USER = os.getenv("MYSQLUSER") or os.getenv("MYSQL_USER")
+MYSQL_PASSWORD = os.getenv("MYSQLPASSWORD") or os.getenv("MYSQL_PASSWORD")
+MYSQL_DB = os.getenv("MYSQLDATABASE") or os.getenv("MYSQL_DATABASE")
+MYSQL_TABLE = os.getenv("MYSQL_TABLE", "propiedades")  # ← tu tabla principal
+
+# Sesión simple por chatId en memoria
 STATE: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(title="FastAPI WhatsApp Agent (DB)", version="2025-11-03")
 
 # ─────────────────────────────────────────────────────────────
-# I/O Models
+# Entrada/Salida
 # ─────────────────────────────────────────────────────────────
 class QualifyIn(BaseModel):
     chatId: str
@@ -40,7 +47,7 @@ class QualifyOut(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────
-# Utils de texto
+# Helpers de texto
 # ─────────────────────────────────────────────────────────────
 def _strip_accents(s: str) -> str:
     if not s:
@@ -62,13 +69,17 @@ def _ask_zone_or_address() -> str:
     return "¿Tenés dirección o link exacto de la propiedad, o estás averiguando por una zona/barrio?"
 
 
-def _ask_qualify_prompt(op: str) -> str:
-    if op == "alquiler":
-        return ("Para avanzar con el alquiler, ¿contás con *ingresos demostrables* que tripliquen el costo y alguna "
-                "*garantía* (caución FINAER / propietario / garantía propietaria)?")
+def _ask_qualify_prompt(intent: str) -> str:
+    if intent == "alquiler":
+        return (
+            "Para avanzar, ¿contás con *ingresos demostrables* que tripliquen el costo y alguna "
+            "*garantía* (preferentemente de CABA: caución FINAER, propietario o garantía propietaria)?"
+        )
     else:
-        return ("Para avanzar con la venta, ¿la operación sería *contado* o *financiado*? "
-                "¿Tenés alguna *seña* o *reserva* prevista? (contame brevemente)")
+        return (
+            "Para avanzar, ¿la operación sería *contado* o *financiado*? "
+            "¿Tenés prevista alguna *seña* o *reserva*?"
+        )
 
 
 def _farewell() -> str:
@@ -76,149 +87,230 @@ def _farewell() -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# DB: conexión y helpers
+# Conexión MySQL (no rompe si falta el driver)
 # ─────────────────────────────────────────────────────────────
-def _build_mysql_params() -> Dict[str, Any]:
-    """
-    Soporta:
-      - MYSQL_URL = mysql://user:pass@host:port/db
-      - o variables sueltas: MYSQLHOST, MYSQLPORT, MYSQLUSER, MYSQLPASSWORD, MYSQL_DATABASE
-    """
-    url = os.getenv("MYSQL_URL") or os.getenv("MYSQL_PUBLIC_URL")  # por si Railway expone este
-    if url:
-        p = urlparse(url)
-        return {
-            "host": p.hostname,
-            "port": p.port or 3306,
-            "user": p.username,
-            "password": p.password,
-            "database": (p.path or "/").lstrip("/"),
-            "autocommit": True,
-        }
+try:
+    import pymysql
+    from pymysql.cursors import DictCursor
+    PYM_AVAILABLE = True
+except Exception:
+    PYM_AVAILABLE = False
 
+
+def _parse_db_url(url: str):
+    """
+    Admite mysql:// ó mysql+pymysql://
+    Devuelve (host, port, user, password, db)
+    """
+    if not url:
+        return None
+    u = urlparse(url)
+    host = u.hostname
+    port = u.port or 3306
+    user = u.username
+    pwd = u.password
+    db = u.path.lstrip("/") if u.path else None
+    return host, port, user, pwd, db
+
+
+def _db_params():
+    if DATABASE_URL:
+        parsed = _parse_db_url(DATABASE_URL)
+        if parsed:
+            return {
+                "host": parsed[0],
+                "port": parsed[1],
+                "user": parsed[2],
+                "password": parsed[3],
+                "database": parsed[4],
+            }
+    # fallback por variables sueltas
     return {
-        "host": os.getenv("MYSQLHOST"),
-        "port": int(os.getenv("MYSQLPORT", "3306")),
-        "user": os.getenv("MYSQLUSER"),
-        "password": os.getenv("MYSQLPASSWORD") or os.getenv("MYSQL_ROOT_PASSWORD"),
-        "database": os.getenv("MYSQL_DATABASE") or os.getenv("MYSQLDATABASE"),
-        "autocommit": True,
+        "host": MYSQL_HOST,
+        "port": MYSQL_PORT,
+        "user": MYSQL_USER,
+        "password": MYSQL_PASSWORD,
+        "database": MYSQL_DB,
     }
 
 
-def _get_conn() -> MySQLConnection:
-    params = _build_mysql_params()
-    return mysql.connector.connect(**params)
-
-
-def _fetch_dicts(cursor) -> List[Dict[str, Any]]:
-    cols = [c[0] for c in cursor.description]
-    return [dict(zip(cols, row)) for row in cursor.fetchall()]
-
-
-def _sql_like(s: str) -> str:
-    return f"%{s}%"
-
-
-def _db_search_candidates(raw_text: str, op: Optional[str]) -> List[Dict[str, Any]]:
+def _safe_connect():
     """
-    Trae candidatos por dirección usando LIKE y pequeñas variantes.
-    Filtra por operación si corresponde:
-      - alquiler => precio_alquiler > 0
-      - venta    => precio_venta > 0
+    Intenta conectar. Si falla o no hay driver, devuelve None (sin romper el flujo).
     """
-    text = re.sub(r"\b(al|altura)\b", "", raw_text, flags=re.I).strip()
-    like1 = _sql_like(text)
-    # sólo calle (si no hay número)
-    only_street = " ".join(re.findall(r"[A-Za-zÁÉÍÓÚÑáéíóúñ\.]+", text)).strip()
-    like2 = _sql_like(only_street) if only_street and only_street != text else None
-
-    where = ["direccion LIKE %s"]
-    params = [like1]
-
-    if like2:
-        where.append("direccion LIKE %s")
-        params.append(like2)
-
-    if op == "alquiler":
-        where.append("COALESCE(precio_alquiler,0) > 0")
-    elif op == "venta":
-        where.append("COALESCE(precio_venta,0) > 0")
-
-    sql = (
-        "SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera, "
-        "precio_venta, precio_alquiler, total_construido "
-        "FROM propiedades "
-        f"WHERE {' AND '.join(['(' + ' OR '.join(where[:2]) + ')'] + where[2:])} "
-        "LIMIT 40"
-        if like2 else
-        "SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera, "
-        "precio_venta, precio_alquiler, total_construido "
-        "FROM propiedades "
-        f"WHERE {' AND '.join(where)} "
-        "LIMIT 40"
-    )
-
-    with _get_conn() as cn:
-        cur = cn.cursor()
-        cur.execute(sql, params)
-        return _fetch_dicts(cur)
-
-
-def _best_address_match(raw_text: str, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not candidates:
+    if not PYM_AVAILABLE:
         return None
-    q = _strip_accents(raw_text)
-    best, best_score = None, 0.0
-    for r in candidates:
-        addr = _strip_accents(r.get("direccion") or "")
-        score = SequenceMatcher(None, q, addr).ratio()
-        if score > best_score:
-            best, best_score = r, score
-    return best if best_score >= 0.55 else None
-
-
-def _render_card_from_row(r: Dict[str, Any], op: Optional[str]) -> str:
-    direccion = r.get("direccion") or "Sin dirección"
-    zona = r.get("zona") or "—"
-    tipo = r.get("tipo_propiedad") or "Propiedad"
-    amb = r.get("ambientes") or 0
-    dorm = r.get("dormitorios") or 0
-    coch = r.get("cochera")
-    coch_txt = "Sí" if (isinstance(coch, (int, float)) and coch > 0) or str(coch).lower() in {"1", "true", "si", "sí"} else "No"
-    m2 = r.get("total_construido") or 0
-
-    pv = r.get("precio_venta")
-    pa = r.get("precio_alquiler")
-
-    def fmt_money(v):
-        if v is None:
-            return "—"
-        try:
-            v = float(v)
-            if v >= 1000:
-                return f"USD {int(v):,}".replace(",", ".")
-            return f"USD {v}"
-        except Exception:
-            return str(v)
-
-    precio = fmt_money(pa if op == "alquiler" else pv if op == "venta" else (pa or pv))
-
-    lines = [
-        f"*{tipo}*",
-        f"{direccion} ({zona})",
-        "",
-        f"• Ambientes: {amb} | Dorm: {dorm} | Sup: {m2} m²",
-        f"• Cochera: {coch_txt}",
-        f"• Precio: {precio}",
-        "",
-        SITE_URL,
-    ]
-    return "\n".join(lines)
+    params = _db_params()
+    if not params.get("host") or not params.get("user") or not params.get("database"):
+        return None
+    try:
+        return pymysql.connect(
+            host=params["host"],
+            port=int(params["port"]),
+            user=params["user"],
+            password=params["password"],
+            database=params["database"],
+            cursorclass=DictCursor,
+            autocommit=True,
+            charset="utf8mb4",
+        )
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────────────────────────
-# Intents y helpers de conversación
+# Búsqueda por dirección en BD
+# ─────────────────────────────────────────────────────────────
+def _build_like_patterns(raw: str) -> List[str]:
+    """
+    Genera variantes tipo LIKE para mejorar recall.
+    """
+    text = raw.strip()
+    # quitar ' al ' / 'altura'
+    text_no_al = re.sub(r"\b(al|altura)\b", "", text, flags=re.I).strip()
+
+    # separar calle y número (si es que hay)
+    num_match = re.search(r"\d{1,5}", text)
+    number = num_match.group(0) if num_match else ""
+    street = re.sub(r"\d{1,5}", "", text).strip()
+
+    pats = []
+    # completo
+    pats.append(f"%{text}%")
+    if text_no_al and text_no_al != text:
+        pats.append(f"%{text_no_al}%")
+    # solo calle
+    if street:
+        pats.append(f"%{street}%")
+    # calle + número pegados
+    if street and number:
+        pats.append(f"%{street} {number}%")
+        pats.append(f"%{street}%{number}%")
+        pats.append(f"%{number}%{street}%")
+    # número solo (por si la carga quedó tipo "Depto en Junín al 600")
+    if number:
+        pats.append(f"%{number}%")
+    # evitar duplicados manteniendo orden
+    seen = set()
+    unique = []
+    for p in pats:
+        if p not in seen:
+            unique.append(p); seen.add(p)
+    return unique
+
+
+def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_total: int = 30) -> List[dict]:
+    rows: List[dict] = []
+    with conn.cursor() as cur:
+        for pat in patterns:
+            if len(rows) >= limit_total:
+                break
+            try:
+                cur.execute(
+                    f"""
+                    SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                           precio_venta, precio_alquiler, total_construido
+                    FROM `{table}`
+                    WHERE direccion LIKE %s
+                    LIMIT %s
+                    """,
+                    (pat, max(5, limit_total // 3)),
+                )
+                rows.extend(cur.fetchall() or [])
+            except Exception:
+                # si la tabla no existe u otro error, salimos
+                return rows
+    return rows
+
+
+def search_db_by_address(raw_text: str) -> Optional[dict]:
+    """
+    Busca la mejor coincidencia por dirección en la base MySQL.
+    Devuelve un dict con las columnas conocidas o None si no encuentra,
+    sin lanzar excepciones hacia arriba.
+    """
+    conn = _safe_connect()
+    if not conn:
+        return None
+    try:
+        patterns = _build_like_patterns(raw_text)
+        # 1) tabla principal
+        candidates = _fetch_candidates_from_table(conn, MYSQL_TABLE, patterns)
+        # 2) fallback a 'propiedad' si vacío
+        if not candidates and MYSQL_TABLE != "propiedad":
+            candidates = _fetch_candidates_from_table(conn, "propiedad", patterns)
+
+        if not candidates:
+            return None
+
+        # ranking fuzzy por dirección
+        q_norm = _strip_accents(raw_text)
+        best, best_score = None, 0.0
+        for r in candidates:
+            addr = _strip_accents(r.get("direccion") or "")
+            score = SequenceMatcher(None, q_norm, addr).ratio()
+            if score > best_score:
+                best, best_score = r, score
+
+        return best if best_score >= 0.55 else None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────
+# Render de ficha desde BD
+# ─────────────────────────────────────────────────────────────
+def _fmt_money(v) -> str:
+    if v in (None, "", "0", 0):
+        return "—"
+    try:
+        v = float(v)
+        if v >= 1000:
+            return f"USD {int(v):,}".replace(",", ".")
+        return f"USD {v}"
+    except Exception:
+        return str(v)
+
+
+def render_property_card_db(row: dict, intent: str) -> str:
+    """
+    row contiene: id, direccion, zona, tipo_propiedad, ambientes,
+    dormitorios, cochera, precio_venta, precio_alquiler, total_construido
+    """
+    addr = row.get("direccion") or "Sin dirección"
+    zona = row.get("zona") or "—"
+    tprop = row.get("tipo_propiedad") or "Propiedad"
+    amb = row.get("ambientes") or 0
+    dorm = row.get("dormitorios") or 0
+    coch = row.get("cochera")
+    coch_txt = "Sí" if str(coch).strip() in {"1", "si", "sí", "true", "True"} else "No"
+    m2 = row.get("total_construido") or 0
+    cod = row.get("id") or "—"
+
+    if intent == "alquiler":
+        price_txt = _fmt_money(row.get("precio_alquiler"))
+        op = "Alquiler"
+    else:
+        price_txt = _fmt_money(row.get("precio_venta"))
+        op = "Venta"
+
+    return (
+        f"*{tprop}*\n"
+        f"{addr} (Zona: {zona})\n\n"
+        f"• Operación: {op}\n"
+        f"• Valor: {price_txt}\n"
+        f"• Sup. construída: {m2} m²\n"
+        f"• Amb: {amb} | Dorm: {dorm} | Cochera: {coch_txt}\n"
+        f"• Código: {cod}\n\n"
+        f"{SITE_URL}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────
+# Motor de conversación / estados
 # ─────────────────────────────────────────────────────────────
 def _reset(chat_id: str):
     STATE[chat_id] = {"stage": "menu"}
@@ -247,15 +339,15 @@ def _is_no(t: str) -> bool:
 def _is_rental_intent(t: str) -> bool:
     t = _strip_accents(t)
     keys = [
-        "alquiler", "alquilo", "alquilar", "quiero alquilar", "busco alquiler",
-        "estoy buscando alquiler", "rentar", "rento", "arrendar"
+        "alquiler", "alquilo", "alquilar", "quiero alquilar",
+        "busco alquiler", "estoy buscando alquiler", "rentar", "arrendar"
     ]
     return any(k in t for k in keys) or t.strip() in {"1", "1-", "1 -", "alquileres"}
 
 
 def _is_sale_intent(t: str) -> bool:
     t = _strip_accents(t)
-    keys = ["venta", "vender", "comprar", "compro", "quiero comprar"]
+    keys = ["venta", "vender", "comprar", "compro", "quiero comprar", "ventas"]
     return any(k in t for k in keys) or t.strip() in {"2", "2-", "2 -", "ventas"}
 
 
@@ -278,7 +370,7 @@ def _is_zone_search(t: str) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────
-# Endpoint principal /qualify
+# Endpoint principal
 # ─────────────────────────────────────────────────────────────
 @app.post("/qualify", response_model=QualifyOut)
 async def qualify(body: QualifyIn) -> QualifyOut:
@@ -288,40 +380,32 @@ async def qualify(body: QualifyIn) -> QualifyOut:
     _ensure_session(chat_id)
     s = STATE[chat_id]
 
+    # RESET
     if _wants_reset(text):
         _reset(chat_id)
         return QualifyOut(reply_text=_say_menu())
 
     stage = s.get("stage", "menu")
 
-    # ── MENU → detectar intención
+    # ── stage: menu → detectar intención
     if stage == "menu":
         if not text:
             return QualifyOut(reply_text=_say_menu())
 
-        if _is_rental_intent(text):
-            s["intent"] = "alquiler"
-            s["stage"] = "ask_zone_or_address"
+        if _is_rental_intent(text) or _is_sale_intent(text) or _is_valuation_intent(text):
+            s["intent"] = "alquiler" if _is_rental_intent(text) else "venta" if _is_sale_intent(text) else "tasacion"
+            s["stage"] = "ask_zone_or_address" if s["intent"] != "tasacion" else "tasacion_address"
+            if s["intent"] == "tasacion":
+                return QualifyOut(
+                    reply_text=("¡Genial! Para la *tasación*, pasame la *dirección exacta* y el *tipo de propiedad* "
+                                "(ej.: departamento 2 amb en Palermo).")
+                )
             return QualifyOut(reply_text=_ask_zone_or_address())
-
-        if _is_sale_intent(text):
-            s["intent"] = "venta"
-            s["stage"] = "ask_zone_or_address"
-            return QualifyOut(reply_text=_ask_zone_or_address())
-
-        if _is_valuation_intent(text):
-            s["intent"] = "tasacion"
-            s["stage"] = "tasacion_address"
-            return QualifyOut(
-                reply_text=("¡Genial! Para la *tasación*, pasame la *dirección exacta* y el *tipo de propiedad* "
-                            "(ej.: departamento 2 amb en Palermo).")
-            )
 
         return QualifyOut(reply_text=_say_menu())
 
-    # ── TASACIONES
+    # ── tasación
     if stage == "tasacion_address":
-        # Guardamos los datos y pedimos contacto
         s["tasacion_input"] = text
         s["stage"] = "tasacion_contact"
         return QualifyOut(
@@ -346,10 +430,9 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             closing_text=_farewell(),
         )
 
-    # ── PREGUNTA DIRECCIÓN / ZONA para ALQUILER o VENTA
+    # ── stage: ask_zone_or_address
     if stage == "ask_zone_or_address":
-        intent = s.get("intent")  # alquiler / venta
-
+        # caso “solo zona/barrio”
         if _is_zone_search(text):
             s["stage"] = "done"
             msg = (
@@ -359,25 +442,28 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             )
             return QualifyOut(reply_text=msg, closing_text=_farewell())
 
-        # Buscar en DB por dirección
-        candidates = await run_in_threadpool(_db_search_candidates, text, intent)
-        best = _best_address_match(text, candidates)
-        if best:
-            s["prop_row"] = best
+        # Buscar en BD por dirección
+        intent = s.get("intent", "alquiler")
+        row = search_db_by_address(text)
+
+        if row:
+            brief = render_property_card_db(row, intent=intent)
+            s["prop_row"] = row
+            s["prop_brief"] = brief
             s["stage"] = "show_property_asked_qualify"
-            brief = _render_card_from_row(best, intent)
             return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt(intent))
 
+        # No hubo match
         return QualifyOut(
-            reply_text=("No pude identificar la ficha a partir del texto. "
-                        "¿Podés confirmarme la *dirección exacta* (calle y número) "
-                        "o, si querés, mirá el catálogo y reenviame el link de la ficha que te interese:\n"
-                        f"{SITE_URL}")
+            reply_text=(
+                "No pude identificar la ficha a partir del texto. "
+                "¿Podés confirmarme la *dirección exacta* tal como figura en la publicación?"
+            )
         )
 
-    # ── Mostrar propiedad y calificar (alquiler/venta)
+    # ── stage: show_property_asked_qualify
     if stage == "show_property_asked_qualify":
-        intent = s.get("intent")
+        intent = s.get("intent", "alquiler")
         nt = _strip_accents(text)
 
         if intent == "alquiler":
@@ -394,14 +480,17 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             if has_income and has_guarantee:
                 s["stage"] = "ask_handover"
                 return QualifyOut(
-                    reply_text=("¡Genial! Con esos datos podés calificar. "
-                                "¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
+                    reply_text=(
+                        "¡Genial! Con esos datos podés calificar. "
+                        "¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
+                    )
                 )
 
             return QualifyOut(
-                reply_text=("Para avanzar necesito confirmar: ¿tenés *ingresos demostrables* que tripliquen el costo "
-                            "y alguna *garantía* (caución FINAER / propietario / garantía propietaria)? "
-                            "Respondé *sí* o contame qué te falta.")
+                reply_text=(
+                    "Para avanzar necesito confirmar: ¿tenés *ingresos demostrables* que tripliquen el costo y alguna "
+                    "*garantía* (caución FINAER / propietario / garantía propietaria)? Respondé *sí* o contame qué te falta."
+                )
             )
 
         # Venta
@@ -425,13 +514,11 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 reply_text=("¿La operación sería *contado* o *financiado*? ¿Tenés prevista *seña* o *reserva*?")
             )
 
-    # ── Confirmar derivación a humano
+    # ── stage: ask_handover
     if stage == "ask_handover":
         if _is_yes(text):
             s["stage"] = "done"
-            row = s.get("prop_row", {})
-            brief = _render_card_from_row(row, s.get("intent"))
-            vendor_msg = f"Lead calificado desde WhatsApp\nChat: {chat_id}\n{brief}"
+            vendor_msg = f"Lead calificado desde WhatsApp.\nChat: {chat_id}\n{ s.get('prop_brief','') }"
             return QualifyOut(
                 reply_text="Perfecto, te derivo con un asesor humano que te contactará por acá. ¡Gracias!",
                 vendor_push=True,
@@ -446,7 +533,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             )
         return QualifyOut(reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? (sí/no)")
 
-    # ── fallback
+    # fallback
     _reset(chat_id)
     return QualifyOut(reply_text=_say_menu())
 
@@ -461,12 +548,13 @@ def health():
 
 @app.get("/debug")
 def debug():
-    # NO exponemos credenciales
+    params = _db_params()
     return {
-        "SITE_URL": SITE_URL,
-        "sessions": len(STATE),
-        "db_host_set": bool(os.getenv("MYSQL_URL") or os.getenv("MYSQLHOST")),
-        "db_name": os.getenv("MYSQL_DATABASE") or os.getenv("MYSQLDATABASE"),
+        "db_driver_available": PYM_AVAILABLE,
+        "db_host_set": bool(params.get("host")),
+        "db_name": params.get("database"),
+        "table": MYSQL_TABLE,
+        "memory_sessions": len(STATE),
     }
 
 
