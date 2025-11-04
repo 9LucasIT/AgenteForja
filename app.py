@@ -454,13 +454,11 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                         "¿Podés confirmarme la *dirección exacta* tal como figura en la publicación?")
         )
 
-    # --- CALIFICACIÓN ---
-        # --- CALIFICACIÓN ---
+       # --- CALIFICACIÓN ---
     if stage == "show_property_asked_qualify":
         intent = s.get("intent", "alquiler")
         nt = _strip_accents(text)
 
-        # Si viene un "sí" directo luego de la ficha (ej: "sí tengo", "sí cuento con todo")
         if s.get("last_prompt") == "qual_requirements" and _is_yes(text):
             s["stage"] = "ask_handover"
             s.pop("last_prompt", None)
@@ -469,29 +467,11 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                             "¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
             )
 
-                if intent == "alquiler":
-            # Señales positivas (presencia de términos)
+        if intent == "alquiler":
             has_income = bool(re.search(r"(ingreso|recibo|demostrable|monotrib|dependencia)", nt))
             has_guarantee = bool(re.search(r"(garantia|garant[ií]a|caucion|propietari[ao]|finaer)", nt))
-            said_yes = _is_yes(text)
-            said_no = _is_no(text)
 
-            # Señales de FALTA / NO TENGO (lenguaje natural)
-            lack_guarantee = bool(
-                re.search(r"(me\s+falta|no\s+tengo|sin)\s+(garant[ií]a|finaer|propietari[ao])", nt)
-                or "falta garantia" in nt
-                or "sin garantia" in nt
-            )
-            lack_income = bool(
-                re.search(r"(me\s+falta|no\s+tengo|no\s+cuento|sin|no\s+dispongo).*(ingreso|recibo|demostrable)", nt)
-                or "no me alcanza" in nt
-                or "no llego a triplicar" in nt
-                or "no triplica" in nt
-                or "no triplico" in nt
-            )
-
-            # Respuesta NO general a los requisitos
-            if said_no and s.get("last_prompt") in {None, "qual_requirements"}:
+            if _is_no(text):
                 s["stage"] = "done"
                 return QualifyOut(
                     reply_text=("Entiendo. Si en otro momento contás con los requisitos, ¡escribinos por acá! "
@@ -499,41 +479,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                     closing_text=_farewell(),
                 )
 
-            # Declaró explícitamente que le falta algo -> NO califica
-            if lack_guarantee or lack_income:
-                s["stage"] = "done"
-                faltante = []
-                if lack_income:
-                    faltante.append("ingresos demostrables")
-                if lack_guarantee:
-                    faltante.append("garantía (FINAER / propietario / garantía propietaria)")
-                faltante_txt = " y ".join(faltante)
-                return QualifyOut(
-                    reply_text=(f"Gracias por la info. Por el momento no calificarías porque te falta *{faltante_txt}*.\n"
-                                "Si más adelante contás con eso, escribinos por acá. Para empezar de cero, enviá *reset*."),
-                    closing_text=_farewell(),
-                )
-
-            # Si la última repregunta fue por garantía y vuelve a decir NO o reitera falta
-            if s.get("last_prompt") == "need_guarantee" and (said_no or lack_guarantee):
-                s["stage"] = "done"
-                return QualifyOut(
-                    reply_text=("Entendido. Sin *garantía* no podríamos avanzar por ahora. "
-                                "Cuando la tengas, escribinos de nuevo. Para reiniciar, enviá *reset*."),
-                    closing_text=_farewell(),
-                )
-
-            # Si la última repregunta fue por ingresos y vuelve a decir NO o reitera falta
-            if s.get("last_prompt") == "need_income" and (said_no or lack_income):
-                s["stage"] = "done"
-                return QualifyOut(
-                    reply_text=("Entendido. Sin *ingresos demostrables* que tripliquen el valor no podríamos avanzar. "
-                                "Si más adelante los tenés, escribinos. Para reiniciar, enviá *reset*."),
-                    closing_text=_farewell(),
-                )
-
-            # Dijo SÍ, o mencionó ambos requisitos, o una frase positiva (“todo”)
-            if said_yes or (has_income and has_guarantee) or "todo" in nt:
+            if has_income and has_guarantee:
                 s["stage"] = "ask_handover"
                 s.pop("last_prompt", None)
                 return QualifyOut(
@@ -541,7 +487,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                                 "¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
                 )
 
-            # Tiene ingresos pero no garantía → repreguntamos por garantía
             if has_income and not has_guarantee:
                 s["last_prompt"] = "need_guarantee"
                 return QualifyOut(
@@ -549,7 +494,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                                 "(caución *FINAER*, *propietario* o *garantía propietaria*)")
                 )
 
-            # Tiene garantía pero no ingresos → repreguntamos por ingresos
             if has_guarantee and not has_income:
                 s["last_prompt"] = "need_income"
                 return QualifyOut(
@@ -565,17 +509,32 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                             "Respondé *sí* o contame qué te falta.")
             )
 
+        # Para ventas (o cualquier otro intent), mantenemos la misma lógica simple:
+        if _is_yes(text):
+            s["stage"] = "ask_handover"
+            s.pop("last_prompt", None)
+            return QualifyOut(
+                reply_text=("¡Genial! ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
+            )
 
-    
+        if _is_no(text):
+            s["stage"] = "done"
+            return QualifyOut(
+                reply_text=("Entiendo. ¡Gracias por la consulta! Si querés retomar en otro momento, enviá *reset*."),
+                closing_text=_farewell(),
+            )
+
+        # Si es ambiguo en ventas → repreguntamos
+        s["last_prompt"] = "qual_requirements"
+        return QualifyOut(
+            reply_text=("¿La operación sería *contado* o *financiado*? ¿Tenés prevista alguna *seña* o *reserva*?")
+        )
 
     # --- CONTACTO CON ASESOR (etapa siguiente) ---
-        # --- PREGUNTA DE DERIVACIÓN (¿te contacto un asesor humano?) ---
     if stage == "ask_handover":
-        # limpiamos cualquier bandera previa para que no quede pegado a este estado
         s.pop("last_prompt", None)
 
         if _is_yes(text):
-            # Derivación a asesor -> cerramos conversación y marcamos done
             s["stage"] = "done"
             vendor_msg = f"Lead calificado desde WhatsApp.\nChat: {chat_id}\n{ s.get('prop_brief','') }"
             return QualifyOut(
@@ -586,7 +545,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             )
 
         if _is_no(text):
-            # Cierre cordial SIN derivar -> marcamos done
             s["stage"] = "done"
             return QualifyOut(
                 reply_text=("¡Gracias por tu consulta! Quedamos a disposición por cualquier otra duda.\n"
@@ -598,5 +556,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         return QualifyOut(
             reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? Respondé *sí* o *no*."
         )
+
 
 
