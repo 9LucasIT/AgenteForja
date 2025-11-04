@@ -500,39 +500,34 @@ async def qualify(body: QualifyIn) -> QualifyOut:
     
 
     # --- CONTACTO CON ASESOR (etapa siguiente) ---
+        # --- PREGUNTA DE DERIVACIÓN (¿te contacto un asesor humano?) ---
     if stage == "ask_handover":
-        # Si responde que SÍ → se deriva al asesor humano
+        # limpiamos cualquier bandera previa para que no quede pegado a este estado
+        s.pop("last_prompt", None)
+
         if _is_yes(text):
+            # Derivación a asesor -> cerramos conversación y marcamos done
             s["stage"] = "done"
-            s.pop("last_prompt", None)
             vendor_msg = f"Lead calificado desde WhatsApp.\nChat: {chat_id}\n{ s.get('prop_brief','') }"
             return QualifyOut(
-                reply_text=(
-                    "¡Genial! Te derivo con un asesor humano que te contactará por acá. ¡Gracias!"
-                ),
+                reply_text="Perfecto, te derivo con un asesor humano que te contactará por acá. ¡Gracias!",
                 vendor_push=True,
                 vendor_message=vendor_msg,
                 closing_text=_farewell(),
             )
 
-        # Si responde que NO → cierra conversación amablemente sin romper flujo
         if _is_no(text):
+            # Cierre cordial SIN derivar -> marcamos done
             s["stage"] = "done"
-            s.pop("last_prompt", None)
             return QualifyOut(
-                reply_text=(
-                    "¡Gracias por tu consulta! Quedamos a disposición por cualquier otra duda. "
-                    "Cuando quieras, escribime de nuevo y arrancamos desde cero."
-                ),
-                vendor_push=False,
-                vendor_message="",
+                reply_text=("¡Gracias por tu consulta! Quedamos a disposición por cualquier otra duda.\n"
+                            "Cuando quieras retomar, escribí *reset* y arrancamos desde cero."),
                 closing_text=_farewell(),
             )
 
-        # Si responde algo ambiguo → repregunta
+        # Si la respuesta no es sí/no, re-preguntamos sin romper el flujo
         return QualifyOut(
-            reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? (sí/no)",
-            vendor_push=False,
-            vendor_message=""
+            reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? Respondé *sí* o *no*."
         )
+
 
