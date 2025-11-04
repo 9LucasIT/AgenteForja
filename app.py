@@ -242,48 +242,73 @@ def _has_price(v) -> bool:
 
 
 def render_property_card_db(row: dict, intent: str) -> str:
-    addr = row.get("direccion") or "Sin dirección"
-    zona = row.get("zona") or "—"
-    tprop = row.get("tipo_propiedad") or "Propiedad"
+    # Título y básicos
+    addr = (row.get("direccion") or "Sin dirección").strip()
+    zona = (row.get("zona") or "—").strip()
+    tprop = (row.get("tipo_propiedad") or "Propiedad").strip()
 
-    amb = _to_int(row.get("ambientes"))
-    dorm = _to_int(row.get("dormitorios"))
-    coch = str(row.get("cochera") or "").strip().lower()
-    coch_txt = "Sí" if coch in {"1", "si", "sí", "true", "t", "y"} else "No"
-    m2 = _to_int(row.get("total_construido"))
+    # Amb / Dorm / Cochera (mantengo tu lógica actual)
+    def _to_int_safe(v):
+        try:
+            if v is None:
+                return 0
+            s = str(v).strip()
+            if s == "":
+                return 0
+            return int(float(s))
+        except Exception:
+            return 0
 
-    has_venta = _has_price(row.get("precio_venta"))
-    has_alq = _has_price(row.get("precio_alquiler"))
+    amb = _to_int_safe(row.get("ambientes"))
+    dorm = _to_int_safe(row.get("dormitorios"))
+    coch_raw = str(row.get("cochera") or "").strip().lower()
+    coch_txt = "Sí" if coch_raw in {"1", "si", "sí", "true", "t", "y"} else "No"
 
-    if has_venta and has_alq:
-        if intent == "alquiler":
-            op = "Alquiler"
-            price_txt = _fmt_money(row.get("precio_alquiler"))
-        else:
-            op = "Venta"
-            price_txt = _fmt_money(row.get("precio_venta"))
-    elif has_venta:
-        op = "Venta"
-        price_txt = _fmt_money(row.get("precio_venta"))
-    elif has_alq:
-        op = "Alquiler"
-        price_txt = _fmt_money(row.get("precio_alquiler"))
+    # === VALORES DESDE BD, SIN CONVERTIR A NÚMERO ===
+    precio_venta = (row.get("precio_venta") or "").strip()
+    precio_alquiler = (row.get("precio_alquiler") or "").strip()
+    total_construido = (row.get("total_construido") or "").strip()
+
+    def _is_empty(s: str) -> bool:
+        if not s:
+            return True
+        s2 = s.lower().strip()
+        return s2 in {"null", "none", "-", "consultar", "0"}
+
+    # Operación + Valor: usamos el que esté cargado en la BD
+    if not _is_empty(precio_alquiler):
+        operacion = "Alquiler"
+        valor = precio_alquiler
+    elif not _is_empty(precio_venta):
+        operacion = "Venta"
+        valor = precio_venta
     else:
-        op = "—"
-        price_txt = "Consultar"
+        operacion = "—"
+        valor = "Consultar"
+
+    # Superficie: usamos el texto tal cual; si viniera solo un número, agregamos m²
+    if _is_empty(total_construido):
+        sup_txt = "—"
+    else:
+        sup_txt = total_construido
+        # Si es solo número, le agrego m²
+        if sup_txt.replace(".", "", 1).isdigit():
+            sup_txt = f"{sup_txt} m²"
 
     cod = row.get("id") or "—"
 
+    # Ficha final (mismo formato que ya usás)
     return (
         f"*{tprop}*\n"
         f"{addr} (Zona: {zona})\n\n"
-        f"• Operación: {op}\n"
-        f"• Valor: {price_txt}\n"
-        f"• Sup. construída: {m2} m²\n"
+        f"• Operación: {operacion}\n"
+        f"• Valor: {valor}\n"
+        f"• Sup. construida: {sup_txt}\n"
         f"• Amb: {amb} | Dorm: {dorm} | Cochera: {coch_txt}\n"
         f"• Código: {cod}\n\n"
         f"{SITE_URL}"
     )
+
 
 
 # =============== Conversación ===============
