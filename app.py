@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any, Tuple, List
 
 from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel, Field
+from pydantic import ConfigDict
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text as sql_text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
@@ -47,7 +48,6 @@ class ChatSession(Base):
 # FASTAPI
 # ===========================
 app = FastAPI()
-
 
 # ===========================
 # HELPERS TEXTO / PARSING
@@ -103,7 +103,6 @@ def has_address_number(txt: str) -> bool:
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-
 # ===========================
 # FIND PROPERTY / REPLIES (atajo de asesor)
 # ===========================
@@ -154,31 +153,25 @@ def get_property_columns(db: Session) -> List[str]:
 
 def select_clause_for_props(cols: List[str]) -> str:
     base = ["id", "codigo", "direccion", "zona", "precio", "dormitorios", "cochera"]
-    # columnas opcionales si existen
     optional = ["operacion", "tipo_operacion", "precio_venta", "precio_alquiler", "ambientes", "tipo_propiedad", "total_construido"]
     selected = [c for c in base if c in cols]
     selected += [c for c in optional if c in cols]
     if not selected:
-        # fallback mínimo
         selected = ["id", "codigo", "direccion", "zona"]
     return ", ".join(selected)
 
 def get_prop_operacion(p: Dict[str, Any]) -> Optional[str]:
-    # Normaliza operación desde posibles nombres de columna
     for k in ("operacion", "tipo_operacion"):
         v = p.get(k)
         if isinstance(v, str) and v.strip():
             t = detect_operacion(v)
             if t:
                 return t
-            # si viene como "venta"/"alquiler" ya sirve
             vs = _norm(v)
             if vs in ("venta", "alquiler"):
                 return vs
         elif isinstance(v, (int, bool)):
-            # por si la guardan como 0/1 (no recomendado)
             return "venta" if int(v) == 1 else "alquiler"
-    # Inferencia por precios (si existen columnas separadas)
     if p.get("precio_venta") and not p.get("precio_alquiler"):
         return "venta"
     if p.get("precio_alquiler") and not p.get("precio_venta"):
@@ -209,7 +202,6 @@ def _try_extract_codigo_from_url(url: str) -> Optional[str]:
         for key in ("codigo", "cod", "c", "id"):
             if key in qs and qs[key]:
                 return str(qs[key][0]).strip().upper()
-        # probar en path A123
         m = CODIGO_RE.search(u.path or "")
         if m:
             return m.group(1).upper()
@@ -238,6 +230,35 @@ def _fetch_page_title_or_og(url: str) -> Optional[str]:
         pass
     return None
 
+def _match_address_like(db: Session, source_text: str, cols: List[str], sel: str):
+    street, number, words = _address_tokens(source_text)
+
+    if street and number and "direccion" in cols:
+        like = f"%{street.split()[0]}%{number}%"
+        res = db.execute(
+            sql_text(f"SELECT {sel} FROM propiedades WHERE direccion LIKE :like LIMIT 1"),
+            {"like": like}
+        )
+        row = res.mappings().first()
+        if row:
+            return row
+
+    if "direccion" in cols:
+        like_parts = [w for w in words if w not in {"calle", "avenida"}][:2]
+        if like_parts:
+            where = " AND ".join([f"direccion LIKE :w{i}" for i in range(len(like_parts))])
+            params = {f"w{i}": f"%{w}%" for i, w in enumerate(like_parts)}
+            res = db.execute(
+                sql_text(f"SELECT {sel} FROM propiedades WHERE {where} LIMIT 3"),
+                params
+            )
+            rows = res.mappings().all()
+            if rows:
+                best = max(rows, key=lambda r: _ratio(" ".join(words), r.get("direccion", "")))
+                return best
+
+    return None
+
 def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, Any]]:
     """Versión extendida: también intenta con URL y título si viene un link."""
     t = _normalize(text_in or "")
@@ -246,7 +267,6 @@ def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, 
 
     # 0) Si viene URL, probamos directo
     url = _extract_first_url(text_in or "")
-    inferred_op_from_link = None
     if url:
         try:
             u = urlparse(url)
@@ -265,8 +285,6 @@ def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, 
                 # sin código → og:title/title
                 title = _fetch_page_title_or_og(url)
                 if title:
-                    inferred_op_from_link = detect_operacion(title) or detect_operacion(url)
-                    # hacemos matching de dirección con el título
                     maybe = _match_address_like(db, title, cols, sel)
                     if maybe:
                         return dict(maybe)
@@ -306,38 +324,8 @@ def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, 
 
     return None
 
-def _match_address_like(db: Session, source_text: str, cols: List[str], sel: str):
-    street, number, words = _address_tokens(source_text)
-
-    if street and number and "direccion" in cols:
-        like = f"%{street.split()[0]}%{number}%"
-        res = db.execute(
-            sql_text(f"SELECT {sel} FROM propiedades WHERE direccion LIKE :like LIMIT 1"),
-            {"like": like}
-        )
-        row = res.mappings().first()
-        if row:
-            return row
-
-    if "direccion" in cols:
-        like_parts = [w for w in words if w not in {"calle", "avenida"}][:2]
-        if like_parts:
-            where = " AND ".join([f"direccion LIKE :w{i}" for i in range(len(like_parts))])
-            params = {f"w{i}": f"%{w}%" for i, w in enumerate(like_parts)}
-            res = db.execute(
-                sql_text(f"SELECT {sel} FROM propiedades WHERE {where} LIMIT 3"),
-                params
-            )
-            rows = res.mappings().all()
-            if rows:
-                best = max(rows, key=lambda r: _ratio(" ".join(words), r.get("direccion", "")))
-                return best
-
-    return None
-
 def build_humane_property_reply(p: Dict[str, Any]) -> str:
     cochera_txt = "con cochera" if (p.get("cochera") in (1, True, "1", "true", "sí", "si")) else "sin cochera"
-    # elegimos qué precio mostrar
     precio = None
     if p.get("precio"):
         try:
@@ -376,7 +364,6 @@ def build_vendor_summary(user_phone: str, p: Dict[str, Any], slots: Dict[str, An
         f"Dorms: {slots.get('dormitorios','N/D')} | Cochera: {slots.get('cochera','N/D')}.\n"
         "Pedir confirmación para visita o enviar comparables."
     )
-
 
 # ===========================
 # SLOTS / SESIONES
@@ -425,14 +412,14 @@ def welcome_reset_message() -> str:
         "Tip: cuando quieras reiniciar la conversación, escribí *reset* y empezamos de cero."
     )
 
-
 # ===========================
 # REQUEST / RESPONSE MODELS
 # ===========================
 class QualifyPayload(BaseModel):
-    user_phone: str = Field(..., description="Número del cliente (solo dígitos, con código país)")
-    text: str = Field("", description="Mensaje del cliente")
+    user_phone: Optional[str] = Field(None, description="Número del cliente (solo dígitos, con código país)")
+    text: Optional[str] = Field("", description="Mensaje del cliente")
     message_id: Optional[str] = Field(None, description="ID mensaje (opcional)")
+    model_config = ConfigDict(extra="allow")  # permite campos extra (Green/Twilio)
 
 class BotResponse(BaseModel):
     text: str
@@ -441,6 +428,63 @@ class BotResponse(BaseModel):
     vendor_push: Optional[bool] = None
     vendor_message: Optional[str] = None
 
+# ===========================
+# NORMALIZACIÓN DE PAYLOADS AJENOS (Green/Twilio)
+# ===========================
+def _extract_from_any_payload(p: QualifyPayload) -> Dict[str, str]:
+    """
+    Acepta formato 'propio' (user_phone, text, message_id) o crudos de Green/Twilio:
+    - Green: chatId, message, senderData.sender, messageData.textMessageData.textMessage
+    - Twilio: From, Body, SmsSid/MessageSid
+    Devuelve dict con { user_phone, text, message_id }.
+    """
+    phone = (p.user_phone or "").strip()
+    text  = (p.text or "").strip()
+    mid   = (p.message_id or "").strip()
+
+    x = getattr(p, "model_extra", {}) or {}
+
+    # PHONE
+    candidates_phone = [
+        phone,
+        str(x.get("chatId", "")),
+        str(x.get("waId", "")),
+        str(x.get("From", "")),
+        str(x.get("senderData", {}).get("sender", "")),
+    ]
+    for cand in candidates_phone:
+        if cand:
+            cand = cand.replace("whatsapp:", "").replace("@c.us", "")
+            cand = re.sub(r"\D", "", cand)
+            if cand:
+                phone = cand
+                break
+
+    # TEXT
+    candidates_text = [
+        text,
+        str(x.get("message", "")),
+        str(x.get("Body", "")),
+        str(x.get("messageData", {}).get("textMessageData", {}).get("textMessage", "")),
+    ]
+    for cand in candidates_text:
+        if cand and cand.strip():
+            text = cand.strip()
+            break
+
+    # MESSAGE ID
+    candidates_mid = [
+        mid,
+        str(x.get("idMessage", "")),
+        str(x.get("MessageSid", "")),
+        str(x.get("SmsSid", "")),
+    ]
+    for cand in candidates_mid:
+        if cand and cand.strip():
+            mid = cand.strip()
+            break
+
+    return {"user_phone": phone, "text": text, "message_id": mid}
 
 # ===========================
 # ENDPOINTS
@@ -469,11 +513,19 @@ def _enforce_operacion_with_property(slots: Dict[str, Any], prop: Dict[str, Any]
 
 @app.post("/qualify", response_model=BotResponse)
 def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
-    phone = (payload.user_phone or "").strip()
-    text_in = (payload.text or "").strip()
+    # Normaliza cualquier payload entrante (nuestro formato o Green/Twilio)
+    norm = _extract_from_any_payload(payload)
+    phone = norm["user_phone"]
+    text_in = norm["text"]
+    message_id = norm["message_id"]
 
     if not phone:
-        raise HTTPException(status_code=422, detail="user_phone is required")
+        return BotResponse(
+            text="No pude leer tu número desde el mensaje. ¿Podés reenviarme el mensaje o escribir *reset* para empezar?",
+            next_question="Contame: ¿la búsqueda es para *alquiler* o para *venta*?",
+            updates={"error": "missing_user_phone"},
+            vendor_push=False
+        )
 
     sess = get_or_create_session(db, phone)
     slots = read_slots(sess)
@@ -538,7 +590,6 @@ def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
             q = "Perfecto. ¿En qué *zona* o *dirección exacta* estás interesado/a? (calle y número si lo tenés)"
             return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "zona"}, vendor_push=have_minimum_for_vendor(slots))
 
-        # si el link traía op en el título, ya la habríamos inferido al crear prop; acá seguimos clásico
         op = detect_operacion(text_in)
         if op:
             slots["operacion"] = op
