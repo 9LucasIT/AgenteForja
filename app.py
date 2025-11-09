@@ -306,10 +306,10 @@ def render_property_card_db(row: dict, intent: str) -> str:
 
     # Operación + Valor: usamos el que esté cargado en la BD
     if not _is_empty(precio_alquiler):
-        operacion = "Alquiler"
+        operacion = "alquiler"
         valor = precio_alquiler
     elif not _is_empty(precio_venta):
-        operacion = "Venta"
+        operacion = "venta"
         valor = precio_venta
     else:
         operacion = "—"
@@ -330,7 +330,7 @@ def render_property_card_db(row: dict, intent: str) -> str:
     return (
         f"*{tprop}*\n"
         f"{addr} (Zona: {zona})\n\n"
-        f"• Operación: {operacion}\n"
+        f"• Operación: {operacion.capitalize()}\n"
         f"• Valor: {valor}\n"
         f"• Sup. construida: {sup_txt}\n"
         f"• Amb: {amb} | Dorm: {dorm} | Cochera: {coch_txt}\n"
@@ -392,6 +392,15 @@ def _try_property_from_link_or_slug(text: str) -> Optional[dict]:
     return None
 # === FIN NUEVO: LINKS ===
 
+# === NUEVO: Validación operación vs propiedad ===
+def _mismatch_msg(user_op: str, prop_op: str) -> str:
+    return (
+        f"Atenti 👀 La propiedad que enviaste está publicada para *{prop_op}*, "
+        f"pero seleccionaste *{user_op}*.\n\n"
+        "Te vuelvo al inicio así elegís la operación correcta o compartís otra propiedad.\n\n"
+        + _say_menu()
+    )
+# === FIN NUEVO ===
 
 
 # =============== Conversación ===============
@@ -496,21 +505,31 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         if not text:
             return QualifyOut(reply_text=_say_menu())
 
-        # === NUEVO: si viene LINK, intento obtener la ficha directo ===
+        # ¿dijo ya una operación en el mismo mensaje?
+        user_op = "alquiler" if _is_rental_intent(text) else "venta" if _is_sale_intent(text) else None
+
+        # === LINK directo en el primer mensaje ===
         row_link = _try_property_from_link_or_slug(text)
         if row_link:
+            prop_op = _infer_intent_from_row(row_link) or "venta"
+
+            # === NUEVO: Validación operación vs propiedad ===
+            if user_op and user_op != prop_op:
+                _reset(chat_id)
+                return QualifyOut(reply_text=_mismatch_msg(user_op, prop_op))
+
+            # si no hay mismatch, seguimos como antes
             s["prop_row"] = row_link
-            intent_infer = _infer_intent_from_row(row_link) or "venta"
-            s["intent"] = intent_infer
-            brief = render_property_card_db(row_link, intent=intent_infer)
+            s["intent"] = user_op or prop_op
+            brief = render_property_card_db(row_link, intent=s["intent"])
             s["prop_brief"] = brief
             s["stage"] = "show_property_asked_qualify"
             s["last_prompt"] = "qual_requirements"
-            return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt(intent_infer))
+            return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt(s["intent"]))
 
-        if _is_rental_intent(text) or _is_sale_intent(text) or _is_valuation_intent(text):
-            s["intent"] = "alquiler" if _is_rental_intent(text) else "venta" if _is_sale_intent(text) else "tasacion"
-            # ======== TASACIÓN 7 PASOS ========
+        # intents clásicos (1/2/3)
+        if user_op or _is_valuation_intent(text):
+            s["intent"] = user_op or "tasacion"
             if s["intent"] == "tasacion":
                 s["stage"] = "tas_op"
                 s["tas_op"] = None
@@ -521,7 +540,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 s["tas_feat"] = None
                 s["tas_disp"] = None
                 return QualifyOut(reply_text="¡Genial! Para la *tasación*, decime el *tipo de operación*: ¿venta o alquiler?")
-            # ======== FIN TASACIÓN ========
             s["stage"] = "ask_zone_or_address"
             return QualifyOut(reply_text=_ask_zone_or_address())
 
@@ -606,17 +624,24 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
     # --- DIRECCIÓN / LINK ---
     if stage == "ask_zone_or_address":
-        # === NUEVO: si viene LINK, intento ficha directo (igual que en menú) ===
+        # LINK en esta etapa
         row_link = _try_property_from_link_or_slug(text)
         if row_link:
-            s["prop_row"] = row_link
             intent_infer = _infer_intent_from_row(row_link) or s.get("intent") or "venta"
-            s["intent"] = intent_infer
-            brief = render_property_card_db(row_link, intent=intent_infer)
+
+            # === NUEVO: Validación operación vs propiedad ===
+            if s.get("intent") and s["intent"] != intent_infer:
+                user_op = s["intent"]
+                _reset(chat_id)
+                return QualifyOut(reply_text=_mismatch_msg(user_op, intent_infer))
+
+            s["prop_row"] = row_link
+            s["intent"] = s.get("intent") or intent_infer
+            brief = render_property_card_db(row_link, intent=s["intent"])
             s["prop_brief"] = brief
             s["stage"] = "show_property_asked_qualify"
             s["last_prompt"] = "qual_requirements"
-            return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt(intent_infer))
+            return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt(s["intent"]))
 
         if _is_zone_search(text):
             s["stage"] = "done"
@@ -631,12 +656,21 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         row = search_db_by_address(text)
 
         if row:
-            brief = render_property_card_db(row, intent=intent)
+            intent_infer = _infer_intent_from_row(row) or intent
+
+            # === NUEVO: Validación operación vs propiedad ===
+            if s.get("intent") and s["intent"] != intent_infer:
+                user_op = s["intent"]
+                _reset(chat_id)
+                return QualifyOut(reply_text=_mismatch_msg(user_op, intent_infer))
+
+            brief = render_property_card_db(row, intent=intent_infer)
             s["prop_row"] = row
             s["prop_brief"] = brief
+            s["intent"] = intent_infer
             s["stage"] = "show_property_asked_qualify"
             s["last_prompt"] = "qual_requirements"
-            return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt(intent))
+            return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt(intent_infer))
 
         return QualifyOut(
             reply_text=("No pude identificar la ficha a partir del texto. "
