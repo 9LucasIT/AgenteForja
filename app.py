@@ -1,488 +1,651 @@
 # app.py
 import os
 import re
-import json
 import unicodedata
-from datetime import datetime
-from typing import Optional, Dict, Any
+from difflib import SequenceMatcher
+from typing import Optional, Dict, Any, List
+from urllib.parse import urlparse
 
-from fastapi import FastAPI, Depends, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text as sql_text
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
+import httpx
+from fastapi import FastAPI
+from pydantic import BaseModel
 
-# ===========================
-# CONFIG
-# ===========================
-SITE_URL = os.getenv("SITE_URL", "https://www.veglienzone.com.ar").rstrip("/")
+SITE_URL = os.getenv("SITE_URL", "https://www.veglienzone.com.ar/").strip()
 
-DATABASE_URL = (
-    os.getenv("DATABASE_URL")
-    or os.getenv("MYSQL_URL")
-    or os.getenv("MYSQL_DATABASE_URL")
-    or ""
-)
-if DATABASE_URL.startswith("mysql://"):
-    DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+pymysql://", 1)
+DATABASE_URL = os.getenv("DATABASE_URL", "") or os.getenv("MYSQL_URL", "")
+MYSQL_HOST = os.getenv("MYSQLHOST") or os.getenv("MYSQL_HOST")
+MYSQL_PORT = int(os.getenv("MYSQLPORT") or os.getenv("MYSQL_PORT") or "3306")
+MYSQL_USER = os.getenv("MYSQLUSER") or os.getenv("MYSQL_USER")
+MYSQL_PASSWORD = os.getenv("MYSQLPASSWORD") or os.getenv("MYSQL_PASSWORD")
+MYSQL_DB = os.getenv("MYSQLDATABASE") or os.getenv("MYSQL_DATABASE")
+MYSQL_TABLE = os.getenv("MYSQL_TABLE", "propiedades")
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300, future=True)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
-Base = declarative_base()
+STATE: Dict[str, Dict[str, Any]] = {}
 
-# ===========================
-# MODELOS (existente)
-# ===========================
-class ChatSession(Base):
-    __tablename__ = "chat_session"
-    id = Column(Integer, primary_key=True)
-    user_phone = Column(String(32), index=True, nullable=False)
-    slots_json = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
+app = FastAPI(title="FastAPI WhatsApp Agent (DB)", version="2025-11-03")
 
-# ===========================
-# FASTAPI
-# ===========================
-app = FastAPI()
+# =============== IO ===============
+class QualifyIn(BaseModel):
+    chatId: str
+    message: Optional[str] = ""
+    isFromMe: Optional[bool] = False
+    senderName: Optional[str] = ""
 
-# ===========================
-# HELPERS GENERALES
-# ===========================
-def now_iso() -> str:
-    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
-def _norm(txt: str) -> str:
-    if not txt:
+class QualifyOut(BaseModel):
+    reply_text: str
+    vendor_push: bool = False
+    vendor_message: str = ""
+    closing_text: str = ""
+
+
+# =============== Texto helpers ===============
+def _strip_accents(s: str) -> str:
+    if not s:
         return ""
-    txt = unicodedata.normalize("NFD", txt).encode("ascii", "ignore").decode("utf-8")
-    return re.sub(r"\s+", " ", txt.lower()).strip()
+    nfkd = unicodedata.normalize("NFKD", s)
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower().strip()
 
-def out(reply_text: str, *, vendor_push: bool=False, vendor_message: Optional[str]=None,
-        closing_text: Optional[str]=None, slots: Optional[dict]=None, stage: Optional[str]=None):
+
+def _say_menu() -> str:
+    return (
+        "Gracias por contactarte con el área comercial de Veglienzone Gestión Inmobiliaria. "
+        "¿Cómo podemos ayudarte hoy?\n"
+        "1- Alquileres\n2- Ventas\n3- Tasaciones\n\n"
+        "Nota: si en cualquier momento escribís *reset*, la conversación se reinicia desde cero."
+    )
+
+
+def _ask_zone_or_address() -> str:
+    return "¿Tenés dirección o link exacto de la propiedad, o estás averiguando por una zona/barrio?"
+
+
+def _ask_qualify_prompt(intent: str) -> str:
+    if intent == "alquiler":
+        return (
+            "Para avanzar, ¿contás con *ingresos demostrables* que tripliquen el costo y alguna "
+            "*garantía* (preferentemente de CABA: caución FINAER, propietario o garantía propietaria)?"
+        )
+    else:
+        return (
+            "Para avanzar, ¿la operación sería *contado* o *financiado*? "
+            "¿Tenés prevista alguna *seña* o *reserva*?"
+        )
+
+
+def _farewell() -> str:
+    return "Perfecto, quedo atento a tus consultas. ¡Gracias por escribir! 😊"
+
+
+# =============== DB ===============
+try:
+    import pymysql
+    from pymysql.cursors import DictCursor
+    PYM_AVAILABLE = True
+except Exception:
+    PYM_AVAILABLE = False
+
+
+def _parse_db_url(url: str):
+    if not url:
+        return None
+    u = urlparse(url)
+    return (u.hostname, u.port or 3306, u.username, u.password, (u.path or "").lstrip("/"))
+
+
+def _db_params():
+    if DATABASE_URL:
+        h, p, u, pwd, db = _parse_db_url(DATABASE_URL)
+        return {"host": h, "port": p, "user": u, "password": pwd, "database": db}
     return {
-        "reply_text": reply_text or "Perdón, estamos con un inconveniente técnico. ¿Podemos intentar de nuevo?",
-        "vendor_push": bool(vendor_push),
-        "vendor_message": vendor_message,
-        "closing_text": closing_text,
-        # inocuos para n8n (por si querés ver slots en logs)
-        "slots": slots,
-        "stage": stage
+        "host": MYSQL_HOST,
+        "port": MYSQL_PORT,
+        "user": MYSQL_USER,
+        "password": MYSQL_PASSWORD,
+        "database": MYSQL_DB,
     }
 
-def yes_no(txt: str) -> Optional[bool]:
-    t = _norm(txt)
-    yes = ("si", "sí", "claro", "ok", "dale", "obvio")
-    no = ("no", "nop", "nunca")
-    if any(t == y or t.startswith(y + " ") for y in yes): return True
-    if any(t == n or t.startswith(n + " ") for n in no): return False
-    return None
 
-def parse_int(txt: str) -> Optional[int]:
-    t = _norm(txt)
-    m = re.search(r"\b(\d+)\b", t)
-    if not m: return None
-    try: return int(m.group(1))
-    except: return None
-
-def parse_money(txt: str) -> Optional[int]:
-    t = _norm(txt)
-    nums = re.findall(r"\d{1,3}(?:[.,]?\d{3})*|\d+", t)
-    if not nums: return None
-    raw = nums[0].replace(".", "").replace(",", "")
-    try: return int(raw)
-    except: return None
-
-def detect_operacion(txt: str) -> Optional[str]:
-    t = _norm(txt)
-    if any(k in t for k in ("alquiler", "alquilo", "alquilar", "renta", "rent", "en alquiler")):
-        return "alquiler"
-    if any(k in t for k in ("venta", "vendo", "vender", "comprar", "compro", "en venta")):
-        return "venta"
-    return None
-
-def has_address_number(txt: str) -> bool:
-    return bool(re.search(r"[a-zA-Záéíóúñü\.]{3,}\s+\d{1,6}", txt or ""))
-
-# ===========================
-# BD: búsqueda por código / dirección / zona (como tenías)
-# ===========================
-STREET_HINTS = [
-    "calle", "c/", "av", "avenida", "pasaje", "pas", "pje", "ruta", "rn", "rp",
-    "boulevard", "bvard", "bv", "diagonal", "diag", "esquina", "entre", "altura"
-]
-CODIGO_RE = re.compile(r"\b([A-Z]\d{3})\b", re.IGNORECASE)
-
-def _normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", s or "").strip().lower()
-
-def _looks_like_address(text: str) -> bool:
-    t = _normalize(text)
-    if any(h in t for h in STREET_HINTS):
-        return True
-    return bool(re.search(r"[a-zA-Záéíóúñü\.]{3,}\s+\d{1,6}", t))
-
-def _address_tokens(text: str):
-    t = _normalize(text)
-    m = re.search(r"([a-zA-Záéíóúñü\. ]{3,})\s+(\d{1,6})", t)
-    street, number = (None, None)
-    if m:
-        street = _normalize(m.group(1)).replace(".", "").strip()
-        number = m.group(2)
-    words = [w for w in re.split(r"[^\wáéíóúñü]+", t) if len(w) >= 4]
-    return street, number, words
-
-def _ratio(a: str, b: str) -> float:
-    from difflib import SequenceMatcher
-    return SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
-
-def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, Any]]:
-    t = _normalize(text_in or "")
-
-    # 1) Código tipo A101/B202
-    m = CODIGO_RE.search(text_in or "")
-    if m:
-        codigo = m.group(1).upper()
-        row = db.execute(
-            sql_text("SELECT id, codigo, direccion, zona, precio, dormitorios, cochera "
-                     "FROM propiedades WHERE codigo=:codigo LIMIT 1"),
-            {"codigo": codigo}
-        ).mappings().first()
-        if row: return dict(row)
-
-    # 2) Dirección aparente
-    if _looks_like_address(t):
-        street, number, words = _address_tokens(t)
-        if street and number:
-            like = f"%{street.split()[0]}%{number}%"
-            row = db.execute(
-                sql_text("SELECT id, codigo, direccion, zona, precio, dormitorios, cochera "
-                         "FROM propiedades WHERE direccion LIKE :like LIMIT 1"),
-                {"like": like}
-            ).mappings().first()
-            if row: return dict(row)
-
-        like_parts = [w for w in words if w not in {"calle", "avenida"}][:2]
-        if like_parts:
-            where = " AND ".join([f"direccion LIKE :w{i}" for i in range(len(like_parts))])
-            params = {f"w{i}": f"%{w}%" for i, w in enumerate(like_parts)}
-            rows = db.execute(
-                sql_text(f"SELECT id, codigo, direccion, zona, precio, dormitorios, cochera "
-                         f"FROM propiedades WHERE {where} LIMIT 3"),
-                params
-            ).mappings().all()
-            if rows:
-                best = max(rows, key=lambda r: _ratio(" ".join(words), r["direccion"]))
-                return dict(best)
-
-    # 3) Zona exacta
-    zonas = db.execute(sql_text("SELECT DISTINCT zona FROM propiedades")).scalars().all()
-    for z in zonas:
-        if _normalize(z) in t:
-            row = db.execute(
-                sql_text("SELECT id, codigo, direccion, zona, precio, dormitorios, cochera "
-                         "FROM propiedades WHERE zona=:z ORDER BY precio ASC LIMIT 1"),
-                {"z": z}
-            ).mappings().first()
-            if row: return dict(row)
-
-    return None
-
-def build_humane_property_reply(p: Dict[str, Any]) -> str:
-    cochera_txt = "con cochera" if (p.get("cochera") in (1, True)) else "sin cochera"
-    precio = int(p["precio"]) if p.get("precio") is not None else 0
-    precio_txt = f"${precio:,}".replace(",", ".") if precio else "a consultar"
-    return (
-        "¡Genial! Sobre esa propiedad:\n"
-        f"• Código: {p.get('codigo', 'N/D')}\n"
-        f"• Dirección: {p.get('direccion','N/D')} ({p.get('zona','N/D')})\n"
-        f"• Precio: {precio_txt}\n"
-        f"• Dormitorios: {p.get('dormitorios','N/D')} – {cochera_txt}\n\n"
-        "¿Querés que coordinemos una visita o te envío opciones parecidas en la zona?"
-    )
-
-def build_vendor_summary(user_phone: str, p: Dict[str, Any], slots: Dict[str, Any]) -> str:
-    return (
-        f"Lead +{user_phone} consultó por COD {p.get('codigo','N/D')} – {p.get('direccion','N/D')} ({p.get('zona','N/D')}).\n"
-        f"Operación: {slots.get('operacion','N/D')} | Presup.: min {slots.get('presupuesto_min','N/D')} / max {slots.get('presupuesto_max','N/D')} | "
-        f"Dorms: {slots.get('dormitorios','N/D')} | Cochera: {slots.get('cochera','N/D')}."
-    )
-
-# ===========================
-# SESIONES / SLOTS
-# ===========================
-def get_db():
-    db = SessionLocal()
+def _safe_connect():
+    if not PYM_AVAILABLE:
+        return None
+    params = _db_params()
+    if not params.get("host") or not params.get("user") or not params.get("database"):
+        return None
     try:
-        yield db
+        return pymysql.connect(
+            host=params["host"],
+            port=int(params["port"]),
+            user=params["user"],
+            password=params["password"],
+            database=params["database"],
+            cursorclass=DictCursor,
+            autocommit=True,
+            charset="utf8mb4",
+        )
+    except Exception:
+        return None
+
+
+def _build_like_patterns(raw: str) -> List[str]:
+    text = raw.strip()
+    text_no_al = re.sub(r"\b(al|altura)\b", "", text, flags=re.I).strip()
+    num = (re.search(r"\d{1,5}", text) or re.match("", "")).group(0) if re.search(r"\d{1,5}", text) else ""
+    street = re.sub(r"\d{1,5}", "", text).strip()
+
+    pats = [f"%{text}%"]
+    if text_no_al and text_no_al != text:
+        pats.append(f"%{text_no_al}%")
+    if street:
+        pats.append(f"%{street}%")
+    if street and num:
+        pats += [f"%{street} {num}%", f"%{street}%{num}%", f"%{num}%{street}%"]
+    if num:
+        pats.append(f"%{num}%")
+
+    seen, out = set(), []
+    for p in pats:
+        if p not in seen:
+            out.append(p); seen.add(p)
+    return out
+
+
+def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_total: int = 30) -> List[dict]:
+    rows: List[dict] = []
+    with conn.cursor() as cur:
+        for pat in patterns:
+            if len(rows) >= limit_total:
+                break
+            try:
+                cur.execute(
+                    f"""
+                    SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                           precio_venta, precio_alquiler, total_construido
+                    FROM `{table}`
+                    WHERE direccion LIKE %s
+                    LIMIT %s
+                    """,
+                    (pat, max(5, limit_total // 3)),
+                )
+                rows.extend(cur.fetchall() or [])
+            except Exception:
+                return rows
+    return rows
+
+
+def search_db_by_address(raw_text: str) -> Optional[dict]:
+    conn = _safe_connect()
+    if not conn:
+        return None
+    try:
+        pats = _build_like_patterns(raw_text)
+        cands = _fetch_candidates_from_table(conn, MYSQL_TABLE, pats)
+        if not cands and MYSQL_TABLE != "propiedad":
+            cands = _fetch_candidates_from_table(conn, "propiedad", pats)
+        if not cands:
+            return None
+
+        qn = _strip_accents(raw_text)
+        best, best_score = None, 0.0
+        for r in cands:
+            addr = _strip_accents(r.get("direccion") or "")
+            score = SequenceMatcher(None, qn, addr).ratio()
+            if score > best_score:
+                best, best_score = r, score
+        return best if best_score >= 0.55 else None
     finally:
-        db.close()
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-def get_or_create_session(db: Session, phone: str) -> ChatSession:
-    sess = db.query(ChatSession).filter(ChatSession.user_phone == phone).first()
-    if not sess:
-        sess = ChatSession(user_phone=phone, slots_json=json.dumps({}))
-        db.add(sess); db.commit(); db.refresh(sess)
-    return sess
 
-def read_slots(sess: ChatSession) -> Dict[str, Any]:
-    try: return json.loads(sess.slots_json or "{}") or {}
-    except: return {}
+# =============== Render ficha ===============
+def _to_int(x, default=0):
+    try:
+        if x is None:
+            return default
+        s = str(x).strip()
+        if s == "":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
 
-def write_slots(db: Session, sess: ChatSession, slots: Dict[str, Any]) -> None:
-    sess.slots_json = json.dumps(slots, ensure_ascii=False)
-    sess.updated_at = datetime.utcnow()
-    db.commit(); db.refresh(sess)
 
-def welcome_reset_message() -> str:
+def _fmt_money(v) -> str:
+    try:
+        if v is None:
+            return "Consultar"
+        s = str(v).strip()
+        if s == "" or s == "0" or s.lower() in {"null", "none"}:
+            return "Consultar"
+        f = float(s)
+        if f <= 0:
+            return "Consultar"
+        return f"USD {int(f):,}".replace(",", ".")
+    except Exception:
+        return "Consultar"
+
+
+def _has_price(v) -> bool:
+    try:
+        if v is None:
+            return False
+        s = str(v).strip()
+        if s == "" or s.lower() in {"null", "none"}:
+            return False
+        f = float(s)
+        return f > 0
+    except Exception:
+        return False
+
+
+def render_property_card_db(row: dict, intent: str) -> str:
+    # Título y básicos
+    addr = (row.get("direccion") or "Sin dirección").strip()
+    zona = (row.get("zona") or "—").strip()
+    tprop = (row.get("tipo_propiedad") or "Propiedad").strip()
+
+    # Amb / Dorm / Cochera (mantengo tu lógica actual)
+    def _to_int_safe(v):
+        try:
+            if v is None:
+                return 0
+            s = str(v).strip()
+            if s == "":
+                return 0
+            return int(float(s))
+        except Exception:
+            return 0
+
+    amb = _to_int_safe(row.get("ambientes"))
+    dorm = _to_int_safe(row.get("dormitorios"))
+    coch_raw = str(row.get("cochera") or "").strip().lower()
+    coch_txt = "Sí" if coch_raw in {"1", "si", "sí", "true", "t", "y"} else "No"
+
+    # === VALORES DESDE BD, SIN CONVERTIR A NÚMERO ===
+    precio_venta = (row.get("precio_venta") or "").strip()
+    precio_alquiler = (row.get("precio_alquiler") or "").strip()
+    total_construido = (row.get("total_construido") or "").strip()
+
+    def _is_empty(s: str) -> bool:
+        if not s:
+            return True
+        s2 = s.lower().strip()
+        return s2 in {"null", "none", "-", "consultar", "0"}
+
+    # Operación + Valor: usamos el que esté cargado en la BD
+    if not _is_empty(precio_alquiler):
+        operacion = "Alquiler"
+        valor = precio_alquiler
+    elif not _is_empty(precio_venta):
+        operacion = "Venta"
+        valor = precio_venta
+    else:
+        operacion = "—"
+        valor = "Consultar"
+
+    # Superficie: usamos el texto tal cual; si viniera solo un número, agregamos m²
+    if _is_empty(total_construido):
+        sup_txt = "—"
+    else:
+        sup_txt = total_construido
+        # Si es solo número, le agrego m²
+        if sup_txt.replace(".", "", 1).isdigit():
+            sup_txt = f"{sup_txt} m²"
+
+    cod = row.get("id") or "—"
+
+    # Ficha final (mismo formato que ya usás)
     return (
-        "¡Arranquemos de nuevo! 😊\n"
-        "Contame: ¿la búsqueda es para *alquiler* o para *venta*?\n"
-        "Tip: cuando quieras reiniciar la conversación, escribí *reset* y empezamos de cero."
+        f"*{tprop}*\n"
+        f"{addr} (Zona: {zona})\n\n"
+        f"• Operación: {operacion}\n"
+        f"• Valor: {valor}\n"
+        f"• Sup. construida: {sup_txt}\n"
+        f"• Amb: {amb} | Dorm: {dorm} | Cochera: {coch_txt}\n"
+        f"• Código: {cod}\n\n"
+        f"{SITE_URL}"
     )
 
-# ===========================
-# TASACIÓN (lo que aprobaste)
-# ===========================
-_TAS_INICIO_KEYWORDS = (
-    "tasacion", "tasación", "tasar", "quiero tasar",
-    "hacer tasacion", "necesito tasacion", "valuar", "valuación", "valoracion"
-)
 
-def _looks_like_tasacion_start(txt: str) -> bool:
-    t = _norm(txt)
-    return any(k in t for k in _TAS_INICIO_KEYWORDS)
 
-def _join_features(lst):
-    if not lst: return "no informado"
-    s = [x for x in lst if x]
-    return ", ".join(s) if s else "no informado"
+# =============== Conversación ===============
+def _reset(chat_id: str):
+    STATE[chat_id] = {"stage": "menu"}
 
-def _extract_features(txt: str):
-    t = _norm(txt)
-    feats = []
-    if any(w in t for w in ("balcon", "balcón", "balkon")): feats.append("balcón")
-    if "patio" in t: feats.append("patio")
-    if "amenities" in t: feats.append("amenities")
-    if "estudio" in t or "factibilidad" in t: feats.append("estudio factibilidad")
-    if t in ("no", "ninguno", "ninguna", "ningunos"): return []
-    return feats
 
-def _tas_questions(step: str) -> str:
-    prompts = {
-        "op":   "¡Genial! Para avanzar con la tasación, decime: ¿*tipo de operación*? (venta o alquiler)",
-        "prop": "Perfecto. ¿Cuál es el *tipo de propiedad*? (ej.: departamento, casa, local, oficina)",
-        "m2":   "Gracias. ¿Cuántos *metros cuadrados* aproximados tiene la propiedad?",
-        "dir":  "Anotado. ¿Cuál es la *dirección exacta* del inmueble? (calle y número; si podés, piso/depto)",
-        "exp":  "¿La propiedad tiene *expensas*? Si tiene, ¿de cuánto es el *costo mensual* (ARS)? Si no, podés decir *no tiene*.",
-        "feat": "¿La propiedad dispone de *balcón, patio, amenities o estudio de factibilidad*? Podés responder con una lista (ej.: “balcón y amenities”) o “no”.",
-        "disp": "¡Último dato! ¿Cuál es tu *disponibilidad horaria* aproximada para que te contacte un asesor?",
-        "fin":  "Perfecto, con todos estos datos ya cuento con lo suficiente para derivarte con un asesor, muchisimas gracias por tu tiempo!",
-    }
-    return prompts.get(step, prompts["op"])
+def _ensure_session(chat_id: str):
+    if chat_id not in STATE:
+        _reset(chat_id)
 
-def _ensure_tas_slots(slots: dict) -> dict:
-    slots.setdefault("_flow", "tasacion")
-    slots.setdefault("_tas_step", "op")
-    for k in ("tas_operacion","tas_propiedad","tas_m2","tas_direccion","tas_expensas","tas_features","tas_disponibilidad"):
-        slots.setdefault(k, None)
-    return slots
 
-class BotResponse(BaseModel):
-    text: str
-    next_question: Optional[str] = None
-    updates: Dict[str, Any] = {}
-    vendor_push: Optional[bool] = None
-    vendor_message: Optional[str] = None
+def _wants_reset(t: str) -> bool:
+    t = _strip_accents(t)
+    return t in {"reset", "reiniciar", "restart"}
 
-def handle_tasacion(slots: dict, incoming_text: str, user_phone: str) -> Dict[str, Any]:
-    slots = _ensure_tas_slots(slots)
-    step = slots.get("_tas_step", "op")
-    text = incoming_text or ""
 
-    if step == "op":
-        op = _norm(text)
-        if "venta" in op: slots["tas_operacion"] = "venta"; slots["_tas_step"] = "prop"
-        elif "alquiler" in op or "renta" in op: slots["tas_operacion"] = "alquiler"; slots["_tas_step"] = "prop"
-        q = _tas_questions(slots["_tas_step"])
-        return out(q, slots=slots, stage=slots["_tas_step"])
+def _is_yes(t: str) -> bool:
+    t = _strip_accents(t)
+    return t in {"si", "sí", "ok", "dale", "claro", "perfecto", "de una", "si, claro", "listo"}
 
-    if step == "prop":
-        slots["tas_propiedad"] = text.strip() or "no informado"
-        slots["_tas_step"] = "m2"
-        q = _tas_questions("m2")
-        return out(q, slots=slots, stage="m2")
 
-    if step == "m2":
-        m2 = parse_int(text)
-        if m2 is None:
-            q = "¿Me pasás un número aproximado de *metros cuadrados*? (ej.: 65)"
-            return out(q, slots=slots, stage="m2")
-        slots["tas_m2"] = m2
-        slots["_tas_step"] = "dir"
-        q = _tas_questions("dir")
-        return out(q, slots=slots, stage="dir")
+def _is_no(t: str) -> bool:
+    t = _strip_accents(t)
+    return t in {"no", "nop", "no gracias", "nah"}
 
-    if step == "dir":
-        slots["tas_direccion"] = text.strip() or "no informado"
-        slots["_tas_step"] = "exp"
-        q = _tas_questions("exp")
-        return out(q, slots=slots, stage="exp")
 
-    if step == "exp":
-        t = _norm(text)
-        if any(w in t for w in ("no tiene", "no", "sin expensas", "sin")):
-            slots["tas_expensas"] = "no tiene"
+def _is_rental_intent(t: str) -> bool:
+    t = _strip_accents(t)
+    keys = [
+        "alquiler", "alquilo", "alquilar", "quiero alquilar",
+        "busco alquiler", "estoy buscando alquiler", "rentar", "arrendar"
+    ]
+    return any(k in t for k in keys) or t.strip() in {"1", "1-", "1 -", "alquileres"}
+
+
+def _is_sale_intent(t: str) -> bool:
+    t = _strip_accents(t)
+    keys = ["venta", "vender", "comprar", "compro", "quiero comprar", "ventas"]
+    return any(k in t for k in keys) or t.strip() in {"2", "2-", "2 -", "ventas"}
+
+
+def _is_valuation_intent(t: str) -> bool:
+    t = _strip_accents(t)
+    keys = ["tasacion", "tasación", "tasar", "tasaciones"]
+    return any(k in t for k in keys) or t.strip() in {"3", "3-", "3 -"}
+
+
+def _is_zone_search(t: str) -> bool:
+    nt = _strip_accents(t)
+    patterns = [
+        r"\bno tengo (la )?direccion\b",
+        r"\bno tengo link\b",
+        r"\bsolo (zona|barrio)\b",
+        r"\bestoy averiguando\b",
+        r"\bbusco.*(zona|barrio)\b",
+    ]
+    return any(re.search(p, nt) for p in patterns)
+
+# ======== NUEVO: helpers mínimos para tasación ========
+def _num_from_text(t: str) -> Optional[int]:
+    m = re.search(r"\b(\d{1,5})\b", t or "")
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+def _money_from_text(t: str) -> Optional[int]:
+    if not t:
+        return None
+    m = re.search(r"\b(\d{1,3}(?:[.,]?\d{3})+|\d+)\b", t.replace(" ", ""))
+    if not m:
+        return None
+    raw = m.group(1).replace(".", "").replace(",", "")
+    try:
+        return int(raw)
+    except Exception:
+        return None
+
+def _has_addr_number_strict(t: str) -> bool:
+    return bool(re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ\.]{3,}\s+\d{1,6}", t or ""))
+
+# =============== Endpoint principal ===============
+@app.post("/qualify", response_model=QualifyOut)
+async def qualify(body: QualifyIn) -> QualifyOut:
+    chat_id = body.chatId
+    text = (body.message or "").strip()
+
+    _ensure_session(chat_id)
+    s = STATE[chat_id]
+
+    if _wants_reset(text):
+        _reset(chat_id)
+        return QualifyOut(reply_text=_say_menu())
+
+    stage = s.get("stage", "menu")
+
+    # --- MENU ---
+    if stage == "menu":
+        if not text:
+            return QualifyOut(reply_text=_say_menu())
+
+        if _is_rental_intent(text) or _is_sale_intent(text) or _is_valuation_intent(text):
+            s["intent"] = "alquiler" if _is_rental_intent(text) else "venta" if _is_sale_intent(text) else "tasacion"
+            # ======== NUEVO: arranque tasación en 7 pasos ========
+            if s["intent"] == "tasacion":
+                s["stage"] = "tas_op"
+                # inicializo contenedor de datos de tasación
+                s["tas_op"] = None
+                s["tas_prop"] = None
+                s["tas_m2"] = None
+                s["tas_dir"] = None
+                s["tas_exp"] = None
+                s["tas_feat"] = None
+                s["tas_disp"] = None
+                return QualifyOut(reply_text="¡Genial! Para la *tasación*, decime el *tipo de operación*: ¿venta o alquiler?")
+            # ======== FIN NUEVO ========
+            s["stage"] = "ask_zone_or_address"
+            return QualifyOut(reply_text=_ask_zone_or_address())
+
+        return QualifyOut(reply_text=_say_menu())
+
+    # ========== NUEVO: TASACIÓN 7 PREGUNTAS ==========
+    if stage == "tas_op":
+        t = _strip_accents(text)
+        if "venta" in t:
+            s["tas_op"] = "venta"
+        elif "alquiler" in t or "renta" in t or "alquilar" in t:
+            s["tas_op"] = "alquiler"
         else:
-            val = parse_money(text)
-            slots["tas_expensas"] = f"${val:,}".replace(",", ".") if val else (text.strip() or "no informado")
-        slots["_tas_step"] = "feat"
-        q = _tas_questions("feat")
-        return out(q, slots=slots, stage="feat")
+            return QualifyOut(reply_text="¿Me confirmás el *tipo de operación*? (venta o alquiler)")
+        s["stage"] = "tas_prop"
+        return QualifyOut(reply_text="Perfecto. ¿Cuál es el *tipo de propiedad*? (ej.: departamento, casa, local, oficina)")
 
-    if step == "feat":
-        feats = _extract_features(text)
-        slots["tas_features"] = _join_features(feats) if feats is not None else "no informado"
-        slots["_tas_step"] = "disp"
-        q = _tas_questions("disp")
-        return out(q, slots=slots, stage="disp")
+    if stage == "tas_prop":
+        s["tas_prop"] = text.strip() or "no informado"
+        s["stage"] = "tas_m2"
+        return QualifyOut(reply_text="Gracias. ¿Cuántos *metros cuadrados* aproximados tiene la propiedad?")
 
-    if step == "disp":
-        slots["tas_disponibilidad"] = text.strip() or "no informado"
-        slots["_tas_step"] = "fin"
+    if stage == "tas_m2":
+        n = _num_from_text(text)
+        if n is None:
+            return QualifyOut(reply_text="¿Me pasás un *número* aproximado de metros cuadrados? (ej.: 65)")
+        s["tas_m2"] = n
+        s["stage"] = "tas_dir"
+        return QualifyOut(reply_text="Anotado. ¿Cuál es la *dirección exacta* del inmueble? (calle y número; si podés, piso/depto)")
+
+    if stage == "tas_dir":
+        if not _has_addr_number_strict(text):
+            return QualifyOut(reply_text="¿Podés pasarme *calle y número*? Si tenés piso/depto, mejor.")
+        s["tas_dir"] = text.strip()
+        s["stage"] = "tas_exp"
+        return QualifyOut(reply_text="¿La propiedad tiene *expensas*? Si tiene, ¿de cuánto es el *costo mensual* (ARS)? Si no, decime *no tiene*.")
+
+    if stage == "tas_exp":
+        t = _strip_accents(text)
+        if any(x in t for x in ("no tiene", "sin expensas", "no")):
+            s["tas_exp"] = "no tiene"
+        else:
+            val = _money_from_text(text)
+            s["tas_exp"] = f"${val:,}".replace(",", ".") if val else (text.strip() or "no informado")
+        s["stage"] = "tas_feat"
+        return QualifyOut(reply_text="¿Dispone *balcón, patio, amenities o estudio de factibilidad*? Podés responder con una lista (ej.: “balcón y amenities”) o “no”.")
+
+    if stage == "tas_feat":
+        t = _strip_accents(text)
+        feats = []
+        if "balcon" in t or "balcón" in text.lower(): feats.append("balcón")
+        if "patio" in t: feats.append("patio")
+        if "amenities" in t: feats.append("amenities")
+        if "estudio" in t or "factibilidad" in t: feats.append("estudio factibilidad")
+        if t in {"no", "ninguno", "ninguna", "ningunos"}: feats = []
+        s["tas_feat"] = ", ".join(feats) if feats else "no"
+        s["stage"] = "tas_disp"
+        return QualifyOut(reply_text="¡Último dato! ¿Cuál es tu *disponibilidad horaria* aproximada para que te contacte un asesor?")
+
+    if stage == "tas_disp":
+        s["tas_disp"] = text.strip() or "no informado"
+        s["stage"] = "done"
+        # resumen para asesor
         resumen = (
             "Tasación solicitada ✅\n"
-            f"• Operación: {slots.get('tas_operacion','N/D')}\n"
-            f"• Propiedad: {slots.get('tas_propiedad','N/D')}\n"
-            f"• Metros²: {slots.get('tas_m2','N/D')}\n"
-            f"• Dirección: {slots.get('tas_direccion','N/D')}\n"
-            f"• Expensas: {slots.get('tas_expensas','N/D')}\n"
-            f"• Extras: {slots.get('tas_features','N/D')}\n"
-            f"• Disponibilidad: {slots.get('tas_disponibilidad','N/D')}\n"
-            f"• Tel cliente: +{user_phone}"
+            f"• Operación: {s.get('tas_op','N/D')}\n"
+            f"• Propiedad: {s.get('tas_prop','N/D')}\n"
+            f"• Metros²: {s.get('tas_m2','N/D')}\n"
+            f"• Dirección: {s.get('tas_dir','N/D')}\n"
+            f"• Expensas: {s.get('tas_exp','N/D')}\n"
+            f"• Extras: {s.get('tas_feat','N/D')}\n"
+            f"• Disponibilidad: {s.get('tas_disp','N/D')}\n"
+            f"• Chat: {chat_id}"
         )
-        closing = _tas_questions("fin")
-        return out(closing, vendor_push=True, vendor_message=resumen, closing_text=closing, slots=slots, stage="fin")
-
-    slots["_tas_step"] = "op"
-    q = _tas_questions("op")
-    return out(q, slots=slots, stage="op")
-
-# ===========================
-# REQUEST / RESPONSE MODELS (entrada flexible)
-# ===========================
-class QualifyPayload(BaseModel):
-    # puede venir user_phone o no; si no, lo deducimos de chatId/etc.
-    user_phone: Optional[str] = Field(None)
-    text: Optional[str] = Field("", description="Mensaje del cliente")
-
-    # alternativos que puede mandar n8n
-    chatId: Optional[str] = None
-    message: Optional[str] = None
-    From: Optional[str] = None
-    waId: Optional[str] = None
-    Body: Optional[str] = None
-    senderData: Optional[dict] = None
-    messageData: Optional[dict] = None
-    message_id: Optional[str] = None
-
-# ===========================
-# ENDPOINTS
-# ===========================
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "ts": now_iso()}
-
-@app.post("/qualify")
-def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
-    # ---- compat entrada ----
-    phone = (payload.user_phone or "").strip()
-    if not phone:
-        chat_id = (
-            payload.chatId or payload.From or payload.waId or
-            (payload.senderData or {}).get("sender") or (payload.senderData or {}).get("chatId") or ""
+        cierre = "Perfecto, con todos estos datos ya cuento con lo suficiente para derivarte con un asesor, muchisimas gracias por tu tiempo!"
+        return QualifyOut(
+            reply_text=cierre,
+            vendor_push=True,
+            vendor_message=resumen,
+            closing_text=""
         )
-        chat_id = str(chat_id)
-        if chat_id:
-            phone = chat_id.replace("@c.us", "").replace("whatsapp:", "").replace("+", "")
-            phone = re.sub(r"\D", "", phone or "")
+    # ========== FIN NUEVO TASACIÓN ==========
 
-    text_in = (payload.text or "").strip()
-    if not text_in:
-        text_in = (
-            payload.message or payload.Body or
-            ((payload.messageData or {}).get("textMessageData", {}) or {}).get("textMessage") or
-            ""
-        ).strip()
+    # --- DIRECCIÓN ---
+    if stage == "ask_zone_or_address":
+        if _is_zone_search(text):
+            s["stage"] = "done"
+            msg = (
+                "Perfecto. Te dejo el link donde están todas nuestras propiedades para que puedas ver si alguna te interesa:\n"
+                f"{SITE_URL}\n\n"
+                "Cualquier consulta puntual de una ficha me escribís por acá."
+            )
+            return QualifyOut(reply_text=msg, closing_text=_farewell())
 
-    if not phone:
-        raise HTTPException(status_code=422, detail="user_phone is required")
+        intent = s.get("intent", "alquiler")
+        row = search_db_by_address(text)
 
-    # ---- sesión ----
-    sess = get_or_create_session(db, phone)
-    slots = read_slots(sess)
+        if row:
+            brief = render_property_card_db(row, intent=intent)
+            s["prop_row"] = row
+            s["prop_brief"] = brief
+            s["stage"] = "show_property_asked_qualify"
+            s["last_prompt"] = "qual_requirements"
+            return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt(intent))
 
-    # ---- reset ----
-    if _norm(text_in) == "reset":
-        slots = {"_stage": "op"}
-        write_slots(db, sess, slots)
-        return out(welcome_reset_message(), slots=slots, stage="op")
+        return QualifyOut(
+            reply_text=("No pude identificar la ficha a partir del texto. "
+                        "¿Podés confirmarme la *dirección exacta* tal como figura en la publicación?")
+        )
 
-    # ---- TASACIÓN (solo recopila y deriva) ----
-    if (slots.get("_flow") == "tasacion") or _looks_like_tasacion_start(text_in):
-        slots["_flow"] = "tasacion"
-        resp = handle_tasacion(slots, text_in, phone)
-        new_slots = resp.get("slots", slots)
-        if isinstance(new_slots, dict):
-            write_slots(db, sess, new_slots)
-        return resp
+       # --- CALIFICACIÓN ---
+    if stage == "show_property_asked_qualify":
+        intent = s.get("intent", "alquiler")
+        nt = _strip_accents(text)
 
-    # ---- ATAJO por código/dirección/zona (igual que antes) ----
-    try:
-        prop = find_property_by_user_text(db, text_in)
-    except Exception:
-        prop = None
-    if prop:
-        # construimos respuesta tipo asesor + push a vendedor
-        slots.setdefault("operacion", detect_operacion(text_in))  # por si vino implícito
-        slots.setdefault("zona", prop.get("zona"))
-        slots.setdefault("direccion", prop.get("direccion"))
-        slots["inmueble_interes"] = prop.get("codigo")
-        slots["_stage"] = "resumen"
-        write_slots(db, sess, slots)
-        humane = build_humane_property_reply(prop)
-        vendor_text = build_vendor_summary(phone, prop, slots)
-        return out(humane, vendor_push=True, vendor_message=vendor_text, slots=slots, stage="resumen")
+        if s.get("last_prompt") == "qual_requirements" and _is_yes(text):
+            s["stage"] = "ask_handover"
+            s.pop("last_prompt", None)
+            return QualifyOut(
+                reply_text=("¡Genial! Con esos datos podés calificar. "
+                            "¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
+            )
 
-    # ---- LOGICA SIMPLE (dos caminos) que pediste ----
-    op = detect_operacion(text_in)
-    if op:
-        # Camino 1: si trae dirección exacta -> buscar ya
-        if has_address_number(text_in):
-            try:
-                prop2 = find_property_by_user_text(db, text_in)
-            except Exception:
-                prop2 = None
-            if prop2:
-                slots["operacion"] = op
-                slots["direccion"] = prop2.get("direccion")
-                slots["zona"] = prop2.get("zona")
-                slots["inmueble_interes"] = prop2.get("codigo")
-                slots["_stage"] = "resumen"
-                write_slots(db, sess, slots)
-                humane = build_humane_property_reply(prop2)
-                vendor_text = build_vendor_summary(phone, prop2, slots)
-                return out(humane, vendor_push=True, vendor_message=vendor_text, slots=slots, stage="resumen")
+        if intent == "alquiler":
+            has_income = bool(re.search(r"(ingreso|recibo|demostrable|monotrib|dependencia)", nt))
+            has_guarantee = bool(re.search(r"(garantia|garant[ií]a|caucion|propietari[ao]|finaer)", nt))
 
-        # Camino 2: no hay dirección -> enviar link y cerrar
-        slots["operacion"] = op
-        write_slots(db, sess, slots)
-        link = f"{SITE_URL}/{'alquiler' if op=='alquiler' else 'venta'}"
-        msg = (f"¡Perfecto! 👌 Te dejo nuestro catálogo de *{op}*: {link}\n"
-               f"Si más tarde tenés una *dirección exacta* o *código* de propiedad, decímelo y te paso la info al instante.")
-        return out(msg, slots=slots, stage="link")
+            if _is_no(text):
+                s["stage"] = "done"
+                return QualifyOut(
+                    reply_text=("Entiendo. Si en otro momento contás con los requisitos, ¡escribinos por acá! "
+                                "Para reiniciar la conversación, enviá *reset*."),
+                    closing_text=_farewell(),
+                )
 
-    # Si no detectamos nada, inicio estándar
-    ask = "¿La búsqueda es para *alquiler* o para *venta*?"
-    slots["_stage"] = "op"
-    write_slots(db, sess, slots)
-    return out(ask, slots=slots, stage="op")
+            if has_income and has_guarantee:
+                s["stage"] = "ask_handover"
+                s.pop("last_prompt", None)
+                return QualifyOut(
+                    reply_text=("¡Genial! Con esos datos podés calificar. "
+                                "¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
+                )
+
+            if has_income and not has_guarantee:
+                s["last_prompt"] = "need_guarantee"
+                return QualifyOut(
+                    reply_text=("Perfecto con los ingresos. ¿Contás con alguna *garantía*? "
+                                "(caución *FINAER*, *propietario* o *garantía propietaria*)")
+                )
+
+            if has_guarantee and not has_income:
+                s["last_prompt"] = "need_income"
+                return QualifyOut(
+                    reply_text=("Bien con la garantía. ¿Podrías confirmarme si tenés *ingresos demostrables* "
+                                "que tripliquen el valor del alquiler?")
+                )
+
+            # Respuesta ambigua → repregunta general
+            s["last_prompt"] = "qual_requirements"
+            return QualifyOut(
+                reply_text=("Para avanzar necesito confirmar: ¿tenés *ingresos demostrables* que tripliquen el costo "
+                            "y alguna *garantía* (caución FINAER / propietario / garantía propietaria)? "
+                            "Respondé *sí* o contame qué te falta.")
+            )
+
+                # --- VENTAS ---
+        if intent == "venta":
+            # Detectamos forma de pago o mención de seña/reserva (incluye negativas: "sin seña", "no tengo seña")
+            has_payment = bool(re.search(r"\b(contado|financiad[oa])\b", nt))
+            mentions_seal = bool(re.search(r"\b(se[ñn]a|reserva)\b", nt))
+            neg_seal = bool(re.search(r"\b(sin|no tengo)\s+(se[ñn]a|reserva)\b", nt))
+
+            # Si respondió algo relevante (cualquiera de las 3), pasamos a la derivación
+            if has_payment or mentions_seal or neg_seal:
+                s["stage"] = "ask_handover"
+                s.pop("last_prompt", None)
+                return QualifyOut(
+                    reply_text=("¡Genial! ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
+                )
+
+            # Si dijo NO a secas, interpretamos como “sin seña / sin reserva” y también avanzamos
+            if _is_no(text):
+                s["stage"] = "ask_handover"
+                s.pop("last_prompt", None)
+                return QualifyOut(
+                    reply_text=("Perfecto. ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
+                )
+
+            # Respuesta ambigua → repreguntamos una sola vez (evita el loop)
+            s["last_prompt"] = "sales_q"
+            return QualifyOut(
+                reply_text=("¿La operación sería *contado* o *financiado*? ¿Tenés prevista alguna *seña* o *reserva*?")
+            )
+
+
+    # --- CONTACTO CON ASESOR (etapa siguiente) ---
+    if stage == "ask_handover":
+        s.pop("last_prompt", None)
+
+        if _is_yes(text):
+            s["stage"] = "done"
+            vendor_msg = f"Lead calificado desde WhatsApp.\nChat: {chat_id}\n{ s.get('prop_brief','') }"
+            return QualifyOut(
+                reply_text="Perfecto, te derivo con un asesor humano que te contactará por acá. ¡Gracias!",
+                vendor_push=True,
+                vendor_message=vendor_msg,
+                closing_text=_farewell(),
+            )
+
+        if _is_no(text):
+            s["stage"] = "done"
+            return QualifyOut(
+                reply_text=("¡Gracias por tu consulta! Quedamos a disposición por cualquier otra duda.\n"
+                            "Cuando quieras retomar, escribí *reset* y arrancamos desde cero."),
+                closing_text=_farewell(),
+            )
+
+        # Si la respuesta no es sí/no, re-preguntamos sin romper el flujo
+        return QualifyOut(
+            reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? Respondé *sí* o *no*."
+        )
