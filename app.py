@@ -6,7 +6,7 @@ import unicodedata
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text as sql_text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
@@ -101,7 +101,7 @@ def now_iso() -> str:
 
 
 # ===========================
-# TASACIÓN – Helpers y Handler
+# TASACIÓN – Helpers y Handler (solo recopila y deriva)
 # ===========================
 _TAS_INICIO_KEYWORDS = ("tasacion", "tasación", "tasar", "quiero tasar", "hacer tasacion", "necesito tasacion", "valuar", "valuación", "valoracion")
 
@@ -218,10 +218,8 @@ def handle_tasacion(slots: dict, incoming_text: str, user_phone: str):
             f"• Tel cliente: +{user_phone}"
         )
         closing = _tas_questions("fin")
-        # En este contrato, usamos 'text' (para el cliente) y 'vendor_message' (para el asesor).
         return BotResponse(text=closing, next_question=None, updates={"slots": slots, "stage": "fin"}, vendor_push=True, vendor_message=resumen)
 
-    # fallback a inicio
     slots["_tas_step"] = "op"
     q = _tas_questions("op")
     return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "op"}, vendor_push=False)
@@ -262,7 +260,6 @@ def _ratio(a: str, b: str) -> float:
 def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, Any]]:
     t = _normalize(text_in or "")
 
-    # 1) Código tipo A101/B202
     m = CODIGO_RE.search(text_in or "")
     if m:
         codigo = m.group(1).upper()
@@ -277,7 +274,6 @@ def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, 
         if row:
             return dict(row)
 
-    # 2) Dirección aparente
     if _looks_like_address(t):
         street, number, words = _address_tokens(t)
 
@@ -310,7 +306,6 @@ def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, 
                 best = max(rows, key=lambda r: _ratio(" ".join(words), r["direccion"]))
                 return dict(best)
 
-    # 3) Zona exacta
     zonas = db.execute(sql_text("SELECT DISTINCT zona FROM propiedades")).scalars().all()
     for z in zonas:
         if _normalize(z) in t:
@@ -421,7 +416,39 @@ def healthz():
     return {"ok": True, "ts": now_iso()}
 
 @app.post("/qualify", response_model=BotResponse)
-def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
+async def qualify(payload: Optional[QualifyPayload] = None, request: Request = None, db: Session = Depends(get_db)):
+    """
+    Mantiene compatibilidad:
+    - Formato original: { user_phone, text, message_id }
+    - Formato Green API crudo: { chatId, message, ... }  -> se normaliza automáticamente
+    """
+    body: Dict[str, Any] = {}
+    if request is not None:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+
+    # Si no vino payload tipado o faltan campos, intentamos mapear desde el body crudo
+    if not payload:
+        user_phone = None
+        text_in = None
+        message_id = None
+
+        # Extraer phone desde chatId (e.g., "5493412565812@c.us") o senderData.sender
+        chat_id = str(body.get("chatId") or body.get("senderData", {}).get("sender") or "")
+        if chat_id:
+            user_phone = chat_id.replace("@c.us", "").replace("whatsapp:", "").replace("+", "")
+            user_phone = re.sub(r"\D", "", user_phone)
+
+        text_in = body.get("message") or body.get("text") or ""
+        message_id = body.get("idMessage") or body.get("message_id") or body.get("SmsSid") or body.get("MessageSid")
+
+        if not user_phone:
+            raise HTTPException(status_code=422, detail="user_phone is required")
+
+        payload = QualifyPayload(user_phone=user_phone, text=text_in or "", message_id=message_id)
+
     phone = (payload.user_phone or "").strip()
     text_in = (payload.text or "").strip()
 
@@ -453,7 +480,6 @@ def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
         prop = None
 
     if prop:
-        # no repreguntamos; actuamos como asesor
         slots.setdefault("zona", prop.get("zona"))
         slots.setdefault("direccion", prop.get("direccion"))
         slots["inmueble_interes"] = prop.get("codigo")
@@ -467,11 +493,11 @@ def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
             text=humane,
             next_question=None,
             updates={"slots": slots, "stage": "resumen"},
-            vendor_push=True,              # n8n: dispara mensaje al vendedor
+            vendor_push=True,
             vendor_message=vendor_text
         )
 
-    # 2) FLUJO POR ETAPAS (formulario conversacional humanizado)
+    # 2) FLUJO POR ETAPAS (alquiler/venta) — intacto
     if stage in ("op", "operacion"):
         if slots.get("operacion"):
             slots["_stage"] = "zona"
