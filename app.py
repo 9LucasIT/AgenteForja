@@ -199,6 +199,35 @@ def search_db_by_address(raw_text: str) -> Optional[dict]:
         except Exception:
             pass
 
+# === NUEVO: búsqueda por zona (para fallback de enlaces) ===
+def search_db_by_zone_token(token: str) -> Optional[dict]:
+    token = token.strip()
+    if not token:
+        return None
+    conn = _safe_connect()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                       precio_venta, precio_alquiler, total_construido
+                FROM `{MYSQL_TABLE}`
+                WHERE zona LIKE %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (f"%{token}%",),
+            )
+            row = cur.fetchone()
+            return row
+    except Exception:
+        return None
+    finally:
+        try: conn.close()
+        except Exception: pass
+
 
 # =============== Render ficha ===============
 def _to_int(x, default=0):
@@ -309,6 +338,60 @@ def render_property_card_db(row: dict, intent: str) -> str:
         f"{SITE_URL}"
     )
 
+# === NUEVO: LINKS ===
+URL_RX = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
+
+STOPWORDS = {"en", "de", "del", "la", "el", "y", "a", "con", "por", "para", "un", "una", "los", "las", "—", "–"}
+
+def _extract_urls(text: str) -> List[str]:
+    return URL_RX.findall(text or "") or []
+
+def _slug_to_candidate_text(url: str) -> str:
+    try:
+        p = urlparse(url)
+        slug = (p.path or "").strip("/").replace("-", " ")
+        slug = re.sub(r"[_/]+", " ", slug)
+        slug = re.sub(r"%[0-9A-Fa-f]{2}", " ", slug)
+        slug = re.sub(r"\s+", " ", slug)
+        return slug.strip()
+    except Exception:
+        return ""
+
+def _infer_intent_from_row(row: dict) -> Optional[str]:
+    venta = str(row.get("precio_venta") or "").strip().lower()
+    alqu = str(row.get("precio_alquiler") or "").strip().lower()
+    if alqu not in {"", "0", "null", "none", "-"}:
+        return "alquiler"
+    if venta not in {"", "0", "null", "none", "-"}:
+        return "venta"
+    return None
+
+def _tokens_from_text(t: str) -> List[str]:
+    t = _strip_accents(t)
+    parts = re.split(r"[^\wáéíóúñü]+", t)
+    return [w for w in parts if len(w) >= 4 and w not in STOPWORDS]
+
+def _try_property_from_link_or_slug(text: str) -> Optional[dict]:
+    urls = _extract_urls(text)
+    if not urls:
+        return None
+
+    # 1) Intento directo con el slug completo (suele traer calle/barrio o tipo)
+    for u in urls:
+        cand = _slug_to_candidate_text(u)
+        if cand:
+            row = search_db_by_address(cand)
+            if row:
+                return row
+
+            # 2) Fallback por tokens de zona (retiro, palermo, etc.)
+            for tk in _tokens_from_text(cand):
+                row2 = search_db_by_zone_token(tk)
+                if row2:
+                    return row2
+    return None
+# === FIN NUEVO: LINKS ===
+
 
 
 # =============== Conversación ===============
@@ -413,12 +496,23 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         if not text:
             return QualifyOut(reply_text=_say_menu())
 
+        # === NUEVO: si viene LINK, intento obtener la ficha directo ===
+        row_link = _try_property_from_link_or_slug(text)
+        if row_link:
+            s["prop_row"] = row_link
+            intent_infer = _infer_intent_from_row(row_link) or "venta"
+            s["intent"] = intent_infer
+            brief = render_property_card_db(row_link, intent=intent_infer)
+            s["prop_brief"] = brief
+            s["stage"] = "show_property_asked_qualify"
+            s["last_prompt"] = "qual_requirements"
+            return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt(intent_infer))
+
         if _is_rental_intent(text) or _is_sale_intent(text) or _is_valuation_intent(text):
             s["intent"] = "alquiler" if _is_rental_intent(text) else "venta" if _is_sale_intent(text) else "tasacion"
-            # ======== NUEVO: arranque tasación en 7 pasos ========
+            # ======== TASACIÓN 7 PASOS ========
             if s["intent"] == "tasacion":
                 s["stage"] = "tas_op"
-                # inicializo contenedor de datos de tasación
                 s["tas_op"] = None
                 s["tas_prop"] = None
                 s["tas_m2"] = None
@@ -427,13 +521,13 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 s["tas_feat"] = None
                 s["tas_disp"] = None
                 return QualifyOut(reply_text="¡Genial! Para la *tasación*, decime el *tipo de operación*: ¿venta o alquiler?")
-            # ======== FIN NUEVO ========
+            # ======== FIN TASACIÓN ========
             s["stage"] = "ask_zone_or_address"
             return QualifyOut(reply_text=_ask_zone_or_address())
 
         return QualifyOut(reply_text=_say_menu())
 
-    # ========== NUEVO: TASACIÓN 7 PREGUNTAS ==========
+    # ========== TASACIÓN 7 PREGUNTAS ==========
     if stage == "tas_op":
         t = _strip_accents(text)
         if "venta" in t:
@@ -490,7 +584,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
     if stage == "tas_disp":
         s["tas_disp"] = text.strip() or "no informado"
         s["stage"] = "done"
-        # resumen para asesor
         resumen = (
             "Tasación solicitada ✅\n"
             f"• Operación: {s.get('tas_op','N/D')}\n"
@@ -509,10 +602,22 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             vendor_message=resumen,
             closing_text=""
         )
-    # ========== FIN NUEVO TASACIÓN ==========
+    # ========== FIN TASACIÓN ==========
 
-    # --- DIRECCIÓN ---
+    # --- DIRECCIÓN / LINK ---
     if stage == "ask_zone_or_address":
+        # === NUEVO: si viene LINK, intento ficha directo (igual que en menú) ===
+        row_link = _try_property_from_link_or_slug(text)
+        if row_link:
+            s["prop_row"] = row_link
+            intent_infer = _infer_intent_from_row(row_link) or s.get("intent") or "venta"
+            s["intent"] = intent_infer
+            brief = render_property_card_db(row_link, intent=intent_infer)
+            s["prop_brief"] = brief
+            s["stage"] = "show_property_asked_qualify"
+            s["last_prompt"] = "qual_requirements"
+            return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt(intent_infer))
+
         if _is_zone_search(text):
             s["stage"] = "done"
             msg = (
@@ -593,14 +698,11 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                             "Respondé *sí* o contame qué te falta.")
             )
 
-                # --- VENTAS ---
         if intent == "venta":
-            # Detectamos forma de pago o mención de seña/reserva (incluye negativas: "sin seña", "no tengo seña")
             has_payment = bool(re.search(r"\b(contado|financiad[oa])\b", nt))
             mentions_seal = bool(re.search(r"\b(se[ñn]a|reserva)\b", nt))
             neg_seal = bool(re.search(r"\b(sin|no tengo)\s+(se[ñn]a|reserva)\b", nt))
 
-            # Si respondió algo relevante (cualquiera de las 3), pasamos a la derivación
             if has_payment or mentions_seal or neg_seal:
                 s["stage"] = "ask_handover"
                 s.pop("last_prompt", None)
@@ -608,7 +710,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                     reply_text=("¡Genial! ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
                 )
 
-            # Si dijo NO a secas, interpretamos como “sin seña / sin reserva” y también avanzamos
             if _is_no(text):
                 s["stage"] = "ask_handover"
                 s.pop("last_prompt", None)
@@ -616,14 +717,13 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                     reply_text=("Perfecto. ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
                 )
 
-            # Respuesta ambigua → repreguntamos una sola vez (evita el loop)
             s["last_prompt"] = "sales_q"
             return QualifyOut(
                 reply_text=("¿La operación sería *contado* o *financiado*? ¿Tenés prevista alguna *seña* o *reserva*?")
             )
 
 
-    # --- CONTACTO CON ASESOR (etapa siguiente) ---
+    # --- CONTACTO CON ASESOR ---
     if stage == "ask_handover":
         s.pop("last_prompt", None)
 
@@ -645,7 +745,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 closing_text=_farewell(),
             )
 
-        # Si la respuesta no es sí/no, re-preguntamos sin romper el flujo
         return QualifyOut(
             reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? Respondé *sí* o *no*."
         )
