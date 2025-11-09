@@ -6,10 +6,13 @@ import unicodedata
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text as sql_text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
+
+# --- NUEVO: middleware base para compatibilidad Green API ---
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # ===========================
 # DB CONFIG
@@ -44,6 +47,62 @@ class ChatSession(Base):
 # ===========================
 app = FastAPI()
 
+# ===========================
+# COMPAT: Middleware para mapear {chatId,message} -> {user_phone,text}
+# (NO toca tu endpoint ni modelos; sólo reescribe el body si hace falta)
+# ===========================
+class QualifyCompatMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path == "/qualify" and request.method.upper() == "POST":
+            try:
+                raw = await request.body()
+                if not raw:
+                    return await call_next(request)
+
+                data = json.loads(raw.decode("utf-8"))
+                if isinstance(data, dict) and "user_phone" not in data:
+                    chat_id = str(
+                        data.get("chatId")
+                        or data.get("From")
+                        or data.get("waId")
+                        or (data.get("senderData", {}) or {}).get("sender")
+                        or (data.get("senderData", {}) or {}).get("chatId")
+                        or ""
+                    )
+                    if chat_id:
+                        user_phone = (
+                            chat_id.replace("@c.us", "")
+                                   .replace("whatsapp:", "")
+                                   .replace("+", "")
+                        )
+                        user_phone = re.sub(r"\D", "", user_phone)
+
+                        # inyectamos user_phone y, si falta, text
+                        data["user_phone"] = user_phone
+                        if "text" not in data:
+                            data["text"] = (
+                                data.get("message")
+                                or data.get("Body")
+                                or (data.get("messageData", {}).get("textMessageData", {}).get("textMessage")
+                                    if isinstance(data.get("messageData"), dict) else "")
+                                or ""
+                            )
+
+                        # reinyectar body
+                        new_body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+                        async def receive():
+                            return {"type": "http.request", "body": new_body}
+
+                        # Starlette: sobrescribimos el canal de recepción
+                        request._receive = receive  # noqa
+            except Exception:
+                # ante cualquier problema seguimos normal (deja error 422 si corresponde)
+                pass
+
+        return await call_next(request)
+
+app.add_middleware(QualifyCompatMiddleware)
 
 # ===========================
 # HELPERS TEXTO / PARSING
@@ -98,7 +157,6 @@ def has_address_number(txt: str) -> bool:
 
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
-
 
 # ===========================
 # TASACIÓN – Helpers y Handler (solo recopila y deriva, sin DB)
@@ -235,7 +293,6 @@ def handle_tasacion(slots: dict, incoming_text: str, user_phone: str):
     q = _tas_questions("op")
     return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "op"}, vendor_push=False)
 
-
 # ===========================
 # FIND PROPERTY / REPLIES (atajo de asesor)
 # ===========================
@@ -357,7 +414,6 @@ def build_vendor_summary(user_phone: str, p: Dict[str, Any], slots: Dict[str, An
         "Pedir confirmación para visita o enviar comparables."
     )
 
-
 # ===========================
 # SLOTS / SESIONES
 # ===========================
@@ -405,7 +461,6 @@ def welcome_reset_message() -> str:
         "Tip: cuando quieras reiniciar la conversación, escribí *reset* y empezamos de cero."
     )
 
-
 # ===========================
 # REQUEST / RESPONSE MODELS
 # ===========================
@@ -420,7 +475,6 @@ class BotResponse(BaseModel):
     updates: Dict[str, Any] = {}
     vendor_push: Optional[bool] = None
     vendor_message: Optional[str] = None
-
 
 # ===========================
 # ENDPOINTS
