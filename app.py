@@ -6,7 +6,7 @@ import unicodedata
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text as sql_text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
@@ -435,14 +435,63 @@ def healthz():
     return {"ok": True, "ts": now_iso()}
 
 @app.post("/qualify", response_model=BotResponse)
-def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
-    phone = (payload.user_phone or "").strip()
-    text_in = (payload.text or "").strip()
+async def qualify(request: Request, db: Session = Depends(get_db)):
+    """
+    Compatibilidad sin tocar n8n:
+    - Acepta tu formato original { user_phone, text, message_id }
+    - Acepta payload Green API crudo { chatId, message, ... } y lo normaliza
+    """
+    # ---- 0) Leer body crudo y normalizar a user_phone/text/message_id ----
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
 
-    if not phone:
+    # 1) Campos "oficiales" si vienen así
+    user_phone = (body.get("user_phone") or "").strip()
+    text_in    = (body.get("text") or "").strip()
+    message_id = body.get("message_id")
+
+    # 2) Si NO vinieron, mapear desde Green API (chatId/message/From/Body/senderData.sender)
+    if not user_phone:
+        chat_id = str(
+            body.get("chatId")
+            or body.get("From")
+            or body.get("waId")
+            or (body.get("senderData", {}) or {}).get("sender")
+            or ""
+        )
+        if chat_id:
+            # Ej.: "5493412565812@c.us" | "whatsapp:+549..." → solo dígitos E.164
+            user_phone = (
+                chat_id.replace("@c.us", "")
+                       .replace("whatsapp:", "")
+                       .replace("+", "")
+            )
+            user_phone = re.sub(r"\D", "", user_phone or "")
+
+    if not text_in:
+        text_in = (
+            body.get("message")
+            or body.get("Body")
+            or (body.get("messageData", {}).get("textMessageData", {}).get("textMessage") if isinstance(body.get("messageData"), dict) else None)
+            or ""
+        ).strip()
+
+    if not message_id:
+        message_id = (
+            body.get("idMessage")
+            or body.get("SmsSid")
+            or body.get("MessageSid")
+            or None
+        )
+
+    if not user_phone:
+        # Mismo error que veías, pero ahora solo ocurrirá si viene vacío chatId también
         raise HTTPException(status_code=422, detail="user_phone is required")
 
-    sess = get_or_create_session(db, phone)
+    # ---- 1) Sesión/slots, igual que tu backend original ----
+    sess = get_or_create_session(db, user_phone)
     slots = read_slots(sess)
     stage = slots.get("_stage") or "op"
 
@@ -456,7 +505,7 @@ def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
     # 0.5) TASACIÓN – inicio o continuación (sin DB)
     if (slots.get("_flow") == "tasacion") or _looks_like_tasacion_start(text_in):
         slots["_flow"] = "tasacion"
-        resp = handle_tasacion(slots, text_in, phone)
+        resp = handle_tasacion(slots, text_in, user_phone)
         write_slots(db, sess, resp.updates.get("slots", slots))
         return resp
 
@@ -475,7 +524,7 @@ def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
         write_slots(db, sess, slots)
 
         humane = build_humane_property_reply(prop)
-        vendor_text = build_vendor_summary(phone, prop, slots)
+        vendor_text = build_vendor_summary(user_phone, prop, slots)
 
         return BotResponse(
             text=humane,
