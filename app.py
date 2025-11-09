@@ -6,7 +6,7 @@ import unicodedata
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text as sql_text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
@@ -101,9 +101,12 @@ def now_iso() -> str:
 
 
 # ===========================
-# TASACIÓN – Helpers y Handler (solo recopila y deriva)
+# TASACIÓN – Helpers y Handler (solo recopila y deriva, sin DB)
 # ===========================
-_TAS_INICIO_KEYWORDS = ("tasacion", "tasación", "tasar", "quiero tasar", "hacer tasacion", "necesito tasacion", "valuar", "valuación", "valoracion")
+_TAS_INICIO_KEYWORDS = (
+    "tasacion", "tasación", "tasar", "quiero tasar",
+    "hacer tasacion", "necesito tasacion", "valuar", "valuación", "valoracion"
+)
 
 def _looks_like_tasacion_start(txt: str) -> bool:
     t = _norm(txt)
@@ -147,10 +150,15 @@ def _ensure_tas_slots(slots: dict) -> dict:
     return slots
 
 def handle_tasacion(slots: dict, incoming_text: str, user_phone: str):
+    """
+    Devuelve BotResponse (mismo contrato que usás):
+    text, next_question, updates, vendor_push, vendor_message
+    """
     slots = _ensure_tas_slots(slots)
     step = slots.get("_tas_step", "op")
     text = incoming_text or ""
 
+    # Paso: tipo de operación
     if step == "op":
         op = _norm(text)
         if "venta" in op:
@@ -162,12 +170,14 @@ def handle_tasacion(slots: dict, incoming_text: str, user_phone: str):
         q = _tas_questions(slots["_tas_step"])
         return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": slots["_tas_step"]}, vendor_push=False)
 
+    # Paso: tipo de propiedad
     if step == "prop":
         slots["tas_propiedad"] = text.strip() or "no informado"
         slots["_tas_step"] = "m2"
         q = _tas_questions("m2")
         return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "m2"}, vendor_push=False)
 
+    # Paso: m2
     if step == "m2":
         m2 = parse_int(text)
         if m2 is None:
@@ -178,12 +188,14 @@ def handle_tasacion(slots: dict, incoming_text: str, user_phone: str):
         q = _tas_questions("dir")
         return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "dir"}, vendor_push=False)
 
+    # Paso: dirección
     if step == "dir":
         slots["tas_direccion"] = text.strip() or "no informado"
         slots["_tas_step"] = "exp"
         q = _tas_questions("exp")
         return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "exp"}, vendor_push=False)
 
+    # Paso: expensas
     if step == "exp":
         t = _norm(text)
         if any(w in t for w in ("no tiene", "no", "sin expensas", "sin")):
@@ -195,6 +207,7 @@ def handle_tasacion(slots: dict, incoming_text: str, user_phone: str):
         q = _tas_questions("feat")
         return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "feat"}, vendor_push=False)
 
+    # Paso: extras (balcón/patio/amenities/estudio)
     if step == "feat":
         feats = _extract_features(text)
         slots["tas_features"] = _join_features(feats) if feats is not None else "no informado"
@@ -202,10 +215,12 @@ def handle_tasacion(slots: dict, incoming_text: str, user_phone: str):
         q = _tas_questions("disp")
         return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "disp"}, vendor_push=False)
 
+    # Paso: disponibilidad horaria → fin y derivación
     if step == "disp":
         slots["tas_disponibilidad"] = text.strip() or "no informado"
         slots["_tas_step"] = "fin"
 
+        # Resumen para el asesor (derivación)
         resumen = (
             "Tasación solicitada ✅\n"
             f"• Operación: {slots.get('tas_operacion','N/D')}\n"
@@ -220,6 +235,7 @@ def handle_tasacion(slots: dict, incoming_text: str, user_phone: str):
         closing = _tas_questions("fin")
         return BotResponse(text=closing, next_question=None, updates={"slots": slots, "stage": "fin"}, vendor_push=True, vendor_message=resumen)
 
+    # Fallback a inicio
     slots["_tas_step"] = "op"
     q = _tas_questions("op")
     return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "op"}, vendor_push=False)
@@ -260,6 +276,7 @@ def _ratio(a: str, b: str) -> float:
 def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, Any]]:
     t = _normalize(text_in or "")
 
+    # 1) Código tipo A101/B202
     m = CODIGO_RE.search(text_in or "")
     if m:
         codigo = m.group(1).upper()
@@ -274,6 +291,7 @@ def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, 
         if row:
             return dict(row)
 
+    # 2) Dirección aparente
     if _looks_like_address(t):
         street, number, words = _address_tokens(t)
 
@@ -306,6 +324,7 @@ def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, 
                 best = max(rows, key=lambda r: _ratio(" ".join(words), r["direccion"]))
                 return dict(best)
 
+    # 3) Zona exacta
     zonas = db.execute(sql_text("SELECT DISTINCT zona FROM propiedades")).scalars().all()
     for z in zonas:
         if _normalize(z) in t:
@@ -410,99 +429,45 @@ class BotResponse(BaseModel):
 
 # ===========================
 # ENDPOINTS
-# ===========================    
+# ===========================
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "ts": now_iso()}
 
 @app.post("/qualify", response_model=BotResponse)
-async def qualify(request: Request, db: Session = Depends(get_db)):
-    """
-    Compatibilidad sin tocar n8n:
-    - Acepta tu formato original { user_phone, text, message_id }
-    - Acepta payload Green API crudo { chatId, message, ... } y lo normaliza
-    - Mantiene TODO tu flujo (alquiler/venta, DB search) + el flujo de tasación nuevo
-    """
-    # ---- 0) Leer body crudo y normalizar a user_phone/text/message_id ----
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
+    phone = (payload.user_phone or "").strip()
+    text_in = (payload.text or "").strip()
 
-    # 1) Campos "oficiales" si vienen así
-    user_phone = (body.get("user_phone") or "").strip()
-    text_in    = (body.get("text") or "").strip()
-    message_id = body.get("message_id")
-
-    # 2) Si NO vinieron, mapear desde Green API (chatId/message/From/Body/senderData.sender)
-    if not user_phone:
-        chat_id = str(
-            body.get("chatId")
-            or body.get("From")
-            or body.get("waId")
-            or (body.get("senderData", {}) or {}).get("sender")
-            or ""
-        )
-        if chat_id:
-            # Ej.: "5493412565812@c.us" | "whatsapp:+549..." → solo dígitos E.164
-            user_phone = (
-                chat_id.replace("@c.us", "")
-                       .replace("whatsapp:", "")
-                       .replace("+", "")
-            )
-            user_phone = re.sub(r"\D", "", user_phone or "")
-
-    if not text_in:
-        text_in = (
-            body.get("message")
-            or body.get("Body")
-            or (body.get("messageData", {}).get("textMessageData", {}).get("textMessage") if isinstance(body.get("messageData"), dict) else None)
-            or ""
-        ).strip()
-
-    if not message_id:
-        message_id = (
-            body.get("idMessage")
-            or body.get("SmsSid")
-            or body.get("MessageSid")
-            or None
-        )
-
-    if not user_phone:
-        # Mismo error que veías, pero ahora solo ocurrirá si viene vacío chatId también
+    if not phone:
         raise HTTPException(status_code=422, detail="user_phone is required")
 
-    # ---- 1) Sesión/slots, igual que tu backend original ----
-    sess = get_or_create_session(db, user_phone)
+    sess = get_or_create_session(db, phone)
     slots = read_slots(sess)
     stage = slots.get("_stage") or "op"
 
-    # RESET
+    # 0) RESET
     if _norm(text_in) == "reset":
         slots = {"_stage": "op"}
         write_slots(db, sess, slots)
         msg = welcome_reset_message()
-        return BotResponse(
-            text=msg,
-            next_question=msg,
-            updates={"slots": slots, "stage": "op"},
-            vendor_push=False
-        )
+        return BotResponse(text=msg, next_question=msg, updates={"slots": slots, "stage": "op"}, vendor_push=False)
 
-    # ---- 2) TASACIÓN – inicio/continuación (solo recopila y deriva, sin DB) ----
+    # 0.5) TASACIÓN – inicio o continuación (sin DB)
     if (slots.get("_flow") == "tasacion") or _looks_like_tasacion_start(text_in):
         slots["_flow"] = "tasacion"
-        resp = handle_tasacion(slots, text_in, user_phone)
+        resp = handle_tasacion(slots, text_in, phone)
         write_slots(db, sess, resp.updates.get("slots", slots))
         return resp
 
-    # ---- 3) ATAJO: propiedad por código/dirección/zona (tu lógica original) ----
+    # 1) ATAJO: consulta por propiedad (código o dirección/zona)
     try:
         prop = find_property_by_user_text(db, text_in)
     except Exception:
         prop = None
 
     if prop:
+        # no repreguntamos; actuamos como asesor
         slots.setdefault("zona", prop.get("zona"))
         slots.setdefault("direccion", prop.get("direccion"))
         slots["inmueble_interes"] = prop.get("codigo")
@@ -510,17 +475,17 @@ async def qualify(request: Request, db: Session = Depends(get_db)):
         write_slots(db, sess, slots)
 
         humane = build_humane_property_reply(prop)
-        vendor_text = build_vendor_summary(user_phone, prop, slots)
+        vendor_text = build_vendor_summary(phone, prop, slots)
 
         return BotResponse(
             text=humane,
             next_question=None,
             updates={"slots": slots, "stage": "resumen"},
-            vendor_push=True,
+            vendor_push=True,              # n8n: dispara mensaje al vendedor
             vendor_message=vendor_text
         )
 
-    # ---- 4) Flujo por etapas (alquiler/venta) — SIN cambios ----
+    # 2) FLUJO POR ETAPAS (formulario conversacional humanizado)
     if stage in ("op", "operacion"):
         if slots.get("operacion"):
             slots["_stage"] = "zona"
@@ -651,13 +616,6 @@ async def qualify(request: Request, db: Session = Depends(get_db)):
             vendor_push=push_guard,
             vendor_message=None
         )
-
-    # Fallback
-    slots["_stage"] = "op"
-    write_slots(db, sess, slots)
-    ask = "¿La búsqueda es para *alquiler* o para *venta*?"
-    return BotResponse(text=ask, next_question=ask, updates={"stage": "op"}, vendor_push=False)
-
 
     # Fallback: reiniciar a op
     slots["_stage"] = "op"
