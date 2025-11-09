@@ -410,70 +410,93 @@ class BotResponse(BaseModel):
 
 # ===========================
 # ENDPOINTS
-# ===========================
+# ===========================    
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "ts": now_iso()}
 
 @app.post("/qualify", response_model=BotResponse)
-async def qualify(payload: Optional[QualifyPayload] = None, request: Request = None, db: Session = Depends(get_db)):
+async def qualify(request: Request, db: Session = Depends(get_db)):
     """
-    Mantiene compatibilidad:
-    - Formato original: { user_phone, text, message_id }
-    - Formato Green API crudo: { chatId, message, ... }  -> se normaliza automáticamente
+    Compatibilidad sin tocar n8n:
+    - Acepta tu formato original { user_phone, text, message_id }
+    - Acepta payload Green API crudo { chatId, message, ... } y lo normaliza
+    - Mantiene TODO tu flujo (alquiler/venta, DB search) + el flujo de tasación nuevo
     """
-    body: Dict[str, Any] = {}
-    if request is not None:
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
+    # ---- 0) Leer body crudo y normalizar a user_phone/text/message_id ----
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
 
-    # Si no vino payload tipado o faltan campos, intentamos mapear desde el body crudo
-    if not payload:
-        user_phone = None
-        text_in = None
-        message_id = None
+    # 1) Campos "oficiales" si vienen así
+    user_phone = (body.get("user_phone") or "").strip()
+    text_in    = (body.get("text") or "").strip()
+    message_id = body.get("message_id")
 
-        # Extraer phone desde chatId (e.g., "5493412565812@c.us") o senderData.sender
-        chat_id = str(body.get("chatId") or body.get("senderData", {}).get("sender") or "")
+    # 2) Si NO vinieron, mapear desde Green API (chatId/message/From/Body/senderData.sender)
+    if not user_phone:
+        chat_id = str(
+            body.get("chatId")
+            or body.get("From")
+            or body.get("waId")
+            or (body.get("senderData", {}) or {}).get("sender")
+            or ""
+        )
         if chat_id:
-            user_phone = chat_id.replace("@c.us", "").replace("whatsapp:", "").replace("+", "")
-            user_phone = re.sub(r"\D", "", user_phone)
+            # Ej.: "5493412565812@c.us" | "whatsapp:+549..." → solo dígitos E.164
+            user_phone = (
+                chat_id.replace("@c.us", "")
+                       .replace("whatsapp:", "")
+                       .replace("+", "")
+            )
+            user_phone = re.sub(r"\D", "", user_phone or "")
 
-        text_in = body.get("message") or body.get("text") or ""
-        message_id = body.get("idMessage") or body.get("message_id") or body.get("SmsSid") or body.get("MessageSid")
+    if not text_in:
+        text_in = (
+            body.get("message")
+            or body.get("Body")
+            or (body.get("messageData", {}).get("textMessageData", {}).get("textMessage") if isinstance(body.get("messageData"), dict) else None)
+            or ""
+        ).strip()
 
-        if not user_phone:
-            raise HTTPException(status_code=422, detail="user_phone is required")
+    if not message_id:
+        message_id = (
+            body.get("idMessage")
+            or body.get("SmsSid")
+            or body.get("MessageSid")
+            or None
+        )
 
-        payload = QualifyPayload(user_phone=user_phone, text=text_in or "", message_id=message_id)
-
-    phone = (payload.user_phone or "").strip()
-    text_in = (payload.text or "").strip()
-
-    if not phone:
+    if not user_phone:
+        # Mismo error que veías, pero ahora solo ocurrirá si viene vacío chatId también
         raise HTTPException(status_code=422, detail="user_phone is required")
 
-    sess = get_or_create_session(db, phone)
+    # ---- 1) Sesión/slots, igual que tu backend original ----
+    sess = get_or_create_session(db, user_phone)
     slots = read_slots(sess)
     stage = slots.get("_stage") or "op"
 
-    # 0) RESET
+    # RESET
     if _norm(text_in) == "reset":
         slots = {"_stage": "op"}
         write_slots(db, sess, slots)
         msg = welcome_reset_message()
-        return BotResponse(text=msg, next_question=msg, updates={"slots": slots, "stage": "op"}, vendor_push=False)
+        return BotResponse(
+            text=msg,
+            next_question=msg,
+            updates={"slots": slots, "stage": "op"},
+            vendor_push=False
+        )
 
-    # 0.5) TASACIÓN – inicio o continuación del flujo (sin buscar en DB)
+    # ---- 2) TASACIÓN – inicio/continuación (solo recopila y deriva, sin DB) ----
     if (slots.get("_flow") == "tasacion") or _looks_like_tasacion_start(text_in):
         slots["_flow"] = "tasacion"
-        resp = handle_tasacion(slots, text_in, phone)
+        resp = handle_tasacion(slots, text_in, user_phone)
         write_slots(db, sess, resp.updates.get("slots", slots))
         return resp
 
-    # 1) ATAJO: consulta por propiedad (código o dirección/zona)
+    # ---- 3) ATAJO: propiedad por código/dirección/zona (tu lógica original) ----
     try:
         prop = find_property_by_user_text(db, text_in)
     except Exception:
@@ -487,7 +510,7 @@ async def qualify(payload: Optional[QualifyPayload] = None, request: Request = N
         write_slots(db, sess, slots)
 
         humane = build_humane_property_reply(prop)
-        vendor_text = build_vendor_summary(phone, prop, slots)
+        vendor_text = build_vendor_summary(user_phone, prop, slots)
 
         return BotResponse(
             text=humane,
@@ -497,7 +520,7 @@ async def qualify(payload: Optional[QualifyPayload] = None, request: Request = N
             vendor_message=vendor_text
         )
 
-    # 2) FLUJO POR ETAPAS (alquiler/venta) — intacto
+    # ---- 4) Flujo por etapas (alquiler/venta) — SIN cambios ----
     if stage in ("op", "operacion"):
         if slots.get("operacion"):
             slots["_stage"] = "zona"
@@ -628,6 +651,13 @@ async def qualify(payload: Optional[QualifyPayload] = None, request: Request = N
             vendor_push=push_guard,
             vendor_message=None
         )
+
+    # Fallback
+    slots["_stage"] = "op"
+    write_slots(db, sess, slots)
+    ask = "¿La búsqueda es para *alquiler* o para *venta*?"
+    return BotResponse(text=ask, next_question=ask, updates={"stage": "op"}, vendor_push=False)
+
 
     # Fallback: reiniciar a op
     slots["_stage"] = "op"
