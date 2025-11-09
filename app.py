@@ -6,7 +6,7 @@ import unicodedata
 from datetime import datetime
 from typing import Optional, Dict, Any
 
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text as sql_text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
@@ -28,8 +28,7 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, futu
 Base = declarative_base()
 
 # ===========================
-# MODELOS (tablas existentes)
-# chat_session: id, user_phone, slots_json, created_at, updated_at
+# MODELOS
 # ===========================
 class ChatSession(Base):
     __tablename__ = "chat_session"
@@ -147,14 +146,20 @@ def _ensure_tas_slots(slots: dict) -> dict:
         slots.setdefault(k, None)
     return slots
 
-class BotResponse(BaseModel):
-    text: str
-    next_question: Optional[str] = None
-    updates: Dict[str, Any] = {}
-    vendor_push: Optional[bool] = None
-    vendor_message: Optional[str] = None
+# ——— Salida que espera n8n ———
+def out(reply_text: str, vendor_push: bool = False, vendor_message: Optional[str] = None, closing_text: Optional[str] = None, slots: Optional[dict] = None, stage: Optional[str] = None):
+    # n8n solo lee estas 4 keys; slots/stage lo guardás en DB como ya hacías
+    return {
+        "reply_text": reply_text or "Perdón, estamos con un inconveniente técnico. ¿Podemos intentar de nuevo?",
+        "vendor_push": bool(vendor_push),
+        "vendor_message": vendor_message,
+        "closing_text": closing_text,
+        # extra (inocuo para n8n)
+        "slots": slots,
+        "stage": stage
+    }
 
-def handle_tasacion(slots: dict, incoming_text: str, user_phone: str) -> BotResponse:
+def handle_tasacion(slots: dict, incoming_text: str, user_phone: str):
     slots = _ensure_tas_slots(slots)
     step = slots.get("_tas_step", "op")
     text = incoming_text or ""
@@ -166,29 +171,29 @@ def handle_tasacion(slots: dict, incoming_text: str, user_phone: str) -> BotResp
         elif "alquiler" in op or "renta" in op:
             slots["tas_operacion"] = "alquiler"; slots["_tas_step"] = "prop"
         q = _tas_questions(slots["_tas_step"])
-        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": slots["_tas_step"]})
+        return out(q, slots=slots, stage=slots["_tas_step"])
 
     if step == "prop":
         slots["tas_propiedad"] = text.strip() or "no informado"
         slots["_tas_step"] = "m2"
         q = _tas_questions("m2")
-        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "m2"})
+        return out(q, slots=slots, stage="m2")
 
     if step == "m2":
         m2 = parse_int(text)
         if m2 is None:
             q = "¿Me pasás un número aproximado de *metros cuadrados*? (ej.: 65)"
-            return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "m2"})
+            return out(q, slots=slots, stage="m2")
         slots["tas_m2"] = m2
         slots["_tas_step"] = "dir"
         q = _tas_questions("dir")
-        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "dir"})
+        return out(q, slots=slots, stage="dir")
 
     if step == "dir":
         slots["tas_direccion"] = text.strip() or "no informado"
         slots["_tas_step"] = "exp"
         q = _tas_questions("exp")
-        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "exp"})
+        return out(q, slots=slots, stage="exp")
 
     if step == "exp":
         t = _norm(text)
@@ -199,14 +204,14 @@ def handle_tasacion(slots: dict, incoming_text: str, user_phone: str) -> BotResp
             slots["tas_expensas"] = f"${val:,}".replace(",", ".") if val else (text.strip() or "no informado")
         slots["_tas_step"] = "feat"
         q = _tas_questions("feat")
-        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "feat"})
+        return out(q, slots=slots, stage="feat")
 
     if step == "feat":
         feats = _extract_features(text)
         slots["tas_features"] = _join_features(feats) if feats is not None else "no informado"
         slots["_tas_step"] = "disp"
         q = _tas_questions("disp")
-        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "disp"})
+        return out(q, slots=slots, stage="disp")
 
     if step == "disp":
         slots["tas_disponibilidad"] = text.strip() or "no informado"
@@ -223,14 +228,14 @@ def handle_tasacion(slots: dict, incoming_text: str, user_phone: str) -> BotResp
             f"• Tel cliente: +{user_phone}"
         )
         closing = _tas_questions("fin")
-        return BotResponse(text=closing, next_question=None, updates={"slots": slots, "stage": "fin"}, vendor_push=True, vendor_message=resumen)
+        return out(closing, vendor_push=True, vendor_message=resumen, closing_text=closing, slots=slots, stage="fin")
 
     slots["_tas_step"] = "op"
     q = _tas_questions("op")
-    return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "op"})
+    return out(q, slots=slots, stage="op")
 
 # ===========================
-# FIND PROPERTY / REPLIES (atajo de asesor) — SIN CAMBIOS
+# FIND PROPERTY / REPLIES — (igual)
 # ===========================
 STREET_HINTS = [
     "calle", "c/", "av", "avenida", "pasaje", "pas", "pje", "ruta", "rn", "rp",
@@ -340,14 +345,14 @@ def build_humane_property_reply(p: Dict[str, Any]) -> str:
 
 def build_vendor_summary(user_phone: str, p: Dict[str, Any], slots: Dict[str, Any]) -> str:
     return (
-        f"Lead {user_phone} consultó por COD {p.get('codigo','N/D')} – {p.get('direccion','N/D')} ({p.get('zona','N/D')}).\n"
+        f"Lead +{user_phone} consultó por COD {p.get('codigo','N/D')} – {p.get('direccion','N/D')} ({p.get('zona','N/D')}).\n"
         f"Operación: {slots.get('operacion','N/D')} | Presup.: min {slots.get('presupuesto_min','N/D')} / max {slots.get('presupuesto_max','N/D')} | "
         f"Dorms: {slots.get('dormitorios','N/D')} | Cochera: {slots.get('cochera','N/D')}.\n"
         "Pedir confirmación para visita o enviar comparables."
     )
 
 # ===========================
-# SLOTS / SESIONES — SIN CAMBIOS
+# SLOTS / SESIONES
 # ===========================
 def get_db():
     db = SessionLocal()
@@ -394,23 +399,20 @@ def welcome_reset_message() -> str:
     )
 
 # ===========================
-# REQUEST / RESPONSE MODELS (mínimo ajuste de entrada)
+# MODELOS DE ENTRADA (sin romper tu flujo)
 # ===========================
 class QualifyPayload(BaseModel):
-    # AHORA opcional: si no viene, lo mapeamos desde chatId
-    user_phone: Optional[str] = Field(None, description="Número del cliente (solo dígitos, con código país)")
-    text: Optional[str] = Field("", description="Mensaje del cliente")
-
-    # Campos alternativos que puede mandar tu n8n (Green API)
+    # user_phone puede venir o no (si no, lo deducimos de chatId)
+    user_phone: Optional[str] = None
+    text: Optional[str] = ""
+    # alternativos que tu n8n puede mandar
     chatId: Optional[str] = None
     message: Optional[str] = None
     From: Optional[str] = None
     waId: Optional[str] = None
     Body: Optional[str] = None
-    senderName: Optional[str] = None
     senderData: Optional[dict] = None
     messageData: Optional[dict] = None
-    message_id: Optional[str] = None
 
 # ===========================
 # ENDPOINTS
@@ -419,11 +421,10 @@ class QualifyPayload(BaseModel):
 def healthz():
     return {"ok": True, "ts": now_iso()}
 
-@app.post("/qualify", response_model=BotResponse)
+@app.post("/qualify")
 def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
-    # -------- MAPEAMOS SI FALTA user_phone / text (NO cambia tu contrato de salida) --------
+    # ——— Entrada flexible (no rompe n8n) ———
     phone = (payload.user_phone or "").strip()
-
     if not phone:
         chat_id = (
             payload.chatId or payload.From or payload.waId or
@@ -443,29 +444,32 @@ def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
         ).strip()
 
     if not phone:
-        # Si llega sin chatId ni user_phone, ahí sí devolvemos 422 (igual que antes)
+        # único caso que devuelve 422 (igual que antes)
         raise HTTPException(status_code=422, detail="user_phone is required")
 
-    # -------- Desde acá, TODO igual a tu flujo original --------
+    # ——— Sesión / slots ———
     sess = get_or_create_session(db, phone)
     slots = read_slots(sess)
     stage = slots.get("_stage") or "op"
 
-    # RESET
+    # ——— RESET ———
     if _norm(text_in) == "reset":
         slots = {"_stage": "op"}
         write_slots(db, sess, slots)
         msg = welcome_reset_message()
-        return BotResponse(text=msg, next_question=msg, updates={"slots": slots, "stage": "op"}, vendor_push=False)
+        return out(msg, slots=slots, stage="op")
 
-    # TASACIÓN (solo recopila y deriva)
+    # ——— TASACIÓN (solo recopila y deriva) ———
     if (slots.get("_flow") == "tasacion") or _looks_like_tasacion_start(text_in):
         slots["_flow"] = "tasacion"
-        resp = handle_tasacion(slots, text_in, phone)
-        write_slots(db, sess, resp.updates.get("slots", slots))
+        resp = handle_tasacion(slots, text_in, phone)  # ya devuelve reply_text/… via out()
+        # persistimos avances si vinieron
+        new_slots = resp.get("slots", slots)
+        if isinstance(new_slots, dict):
+            write_slots(db, sess, new_slots)
         return resp
 
-    # ===== ATAJO asesor: código/dirección/zona (SIN CAMBIOS) =====
+    # ——— ATAJO asesor: código/dirección/zona ———
     try:
         prop = find_property_by_user_text(db, text_in)
     except Exception:
@@ -481,21 +485,15 @@ def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
         humane = build_humane_property_reply(prop)
         vendor_text = build_vendor_summary(phone, prop, slots)
 
-        return BotResponse(
-            text=humane,
-            next_question=None,
-            updates={"slots": slots, "stage": "resumen"},
-            vendor_push=True,
-            vendor_message=vendor_text
-        )
+        return out(humane, vendor_push=True, vendor_message=vendor_text, slots=slots, stage="resumen")
 
-    # ===== FORM conversacional (SIN CAMBIOS) =====
+    # ——— FORM conversacional (SIN CAMBIOS) ———
     if stage in ("op", "operacion"):
         if slots.get("operacion"):
             slots["_stage"] = "zona"
             write_slots(db, sess, slots)
             q = "Perfecto. ¿En qué *zona* o *dirección exacta* estás interesado/a? (calle y número si lo tenés)"
-            return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "zona"}, vendor_push=False)
+            return out(q, slots=slots, stage="zona")
 
         op = detect_operacion(text_in)
         if op:
@@ -503,10 +501,10 @@ def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
             slots["_stage"] = "zona"
             write_slots(db, sess, slots)
             q = f"Perfecto, {op}. ¿En qué *zona* o *dirección exacta* estás buscando? (calle y número si lo tenés)"
-            return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "zona"}, vendor_push=False)
+            return out(q, slots=slots, stage="zona")
 
         ask = "¿La búsqueda es para *alquiler* o para *venta*?"
-        return BotResponse(text=ask, next_question=ask, updates={"stage": "op"}, vendor_push=False)
+        return out(ask, slots=slots, stage="op")
 
     if stage == "zona":
         if has_address_number(text_in):
@@ -516,51 +514,51 @@ def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
         slots["_stage"] = "pmin"
         write_slots(db, sess, slots)
         q = "¿Cuál sería tu *presupuesto mínimo* aproximado (en ARS)?"
-        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "pmin"}, vendor_push=False)
+        return out(q, slots=slots, stage="pmin")
 
     if stage == "pmin":
         val = parse_money(text_in)
         if val is None:
             q = "No me quedó claro. Decime un número aproximado para el *presupuesto mínimo* (en ARS)."
-            return BotResponse(text=q, next_question=q, updates={"stage": "pmin"}, vendor_push=False)
+            return out(q, slots=slots, stage="pmin")
         slots["presupuesto_min"] = val
         slots["_stage"] = "pmax"
         write_slots(db, sess, slots)
         q = "Genial. ¿Y el *presupuesto máximo* aproximado (en ARS)?"
-        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "pmax"}, vendor_push=False)
+        return out(q, slots=slots, stage="pmax")
 
     if stage == "pmax":
         val = parse_money(text_in)
         if val is None:
             q = "Entendido. ¿Podés indicarme un número para el *presupuesto máximo* (en ARS)?"
-            return BotResponse(text=q, next_question=q, updates={"stage": "pmax"}, vendor_push=False)
+            return out(q, slots=slots, stage="pmax")
         slots["presupuesto_max"] = val
         slots["_stage"] = "dorm"
         write_slots(db, sess, slots)
         q = "Para afinar la búsqueda: ¿Cuántos *dormitorios* te gustaría?"
-        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "dorm"}, vendor_push=False)
+        return out(q, slots=slots, stage="dorm")
 
     if stage == "dorm":
         n = parse_int(text_in)
         if n is None:
             q = "¿Cuántos *dormitorios* querés? (ej.: 2)"
-            return BotResponse(text=q, next_question=q, updates={"stage": "dorm"}, vendor_push=False)
+            return out(q, slots=slots, stage="dorm")
         slots["dormitorios"] = n
         slots["_stage"] = "cochera"
         write_slots(db, sess, slots)
         q = "¿Necesitás *cochera*? (sí/no)"
-        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "cochera"}, vendor_push=False)
+        return out(q, slots=slots, stage="cochera")
 
     if stage == "cochera":
         yn = yes_no(text_in)
         if yn is None:
             q = "¿Te sirve con *cochera*? (sí/no)"
-            return BotResponse(text=q, next_question=q, updates={"stage": "cochera"}, vendor_push=False)
+            return out(q, slots=slots, stage="cochera")
         slots["cochera"] = bool(yn)
         slots["_stage"] = "mascotas"
         write_slots(db, sess, slots)
         q = "¿Tenés *mascotas* que debamos contemplar?"
-        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "mascotas"}, vendor_push=False)
+        return out(q, slots=slots, stage="mascotas")
 
     if stage == "mascotas":
         t = _norm(text_in)
@@ -573,14 +571,14 @@ def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
 
         if tiene is None:
             q = "¿Tenés *mascotas*? (Podés decirme *no* o contame: perros, gatos, etc.)"
-            return BotResponse(text=q, next_question=q, updates={"stage": "mascotas"}, vendor_push=False)
+            return out(q, slots=slots, stage="mascotas")
 
         slots["mascotas"] = desc if tiene else "no"
         if not slots.get("direccion"):
             slots["_stage"] = "direccion"
             write_slots(db, sess, slots)
             q = "¿Tenés una *dirección exacta*? (calle y número) Si no, decime *no tengo* y sigo."
-            return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "direccion"}, vendor_push=False)
+            return out(q, slots=slots, stage="direccion")
 
         slots["_stage"] = "resumen"
         write_slots(db, sess, slots)
@@ -611,10 +609,10 @@ def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
 
         follow = "¿Querés que te envíe opciones que coincidan, o querés ajustar algún dato?"
         text_out = f"{header}\n\n{follow}"
-        return BotResponse(text=text_out, next_question=follow, updates={"slots": slots, "stage": "resumen"}, vendor_push=False)
+        return out(text_out, slots=slots, stage="resumen")
 
     # Fallback
     slots["_stage"] = "op"
     write_slots(db, sess, slots)
     ask = "¿La búsqueda es para *alquiler* o para *venta*?"
-    return BotResponse(text=ask, next_question=ask, updates={"stage": "op"}, vendor_push=False)
+    return out(ask, slots=slots, stage="op")
