@@ -4,17 +4,12 @@ import re
 import json
 import unicodedata
 from datetime import datetime
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI, Depends, HTTPException
 from pydantic import BaseModel, Field
-from pydantic import ConfigDict
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, text as sql_text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
-
-# Extras para manejo de links y fetch
-from urllib.parse import urlparse, parse_qs
-import httpx
 
 # ===========================
 # DB CONFIG
@@ -48,6 +43,7 @@ class ChatSession(Base):
 # FASTAPI
 # ===========================
 app = FastAPI()
+
 
 # ===========================
 # HELPERS TEXTO / PARSING
@@ -103,6 +99,134 @@ def has_address_number(txt: str) -> bool:
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
+
+# ===========================
+# TASACIÓN – Helpers y Handler
+# ===========================
+_TAS_INICIO_KEYWORDS = ("tasacion", "tasación", "tasar", "quiero tasar", "hacer tasacion", "necesito tasacion", "valuar", "valuación", "valoracion")
+
+def _looks_like_tasacion_start(txt: str) -> bool:
+    t = _norm(txt)
+    return any(k in t for k in _TAS_INICIO_KEYWORDS)
+
+def _join_features(lst):
+    if not lst:
+        return "no informado"
+    s = [x for x in lst if x]
+    return ", ".join(s) if s else "no informado"
+
+def _extract_features(txt: str):
+    t = _norm(txt)
+    feats = []
+    if any(w in t for w in ("balcon", "balcón", "balkon")): feats.append("balcón")
+    if "patio" in t: feats.append("patio")
+    if "amenities" in t: feats.append("amenities")
+    if "estudio" in t or "factibilidad" in t: feats.append("estudio factibilidad")
+    if t in ("no", "ninguno", "ninguna", "ningunos"):
+        return []
+    return feats
+
+def _tas_questions(step: str) -> str:
+    prompts = {
+        "op":   "¡Genial! Para avanzar con la tasación, decime: ¿*tipo de operación*? (venta o alquiler)",
+        "prop": "Perfecto. ¿Cuál es el *tipo de propiedad*? (ej.: departamento, casa, local, oficina)",
+        "m2":   "Gracias. ¿Cuántos *metros cuadrados* aproximados tiene la propiedad?",
+        "dir":  "Anotado. ¿Cuál es la *dirección exacta* del inmueble? (calle y número; si podés, piso/depto)",
+        "exp":  "¿La propiedad tiene *expensas*? Si tiene, ¿de cuánto es el *costo mensual* (ARS)? Si no, podés decir *no tiene*.",
+        "feat": "¿La propiedad dispone de *balcón, patio, amenities o estudio de factibilidad*? Podés responder con una lista (ej.: “balcón y amenities”) o “no”.",
+        "disp": "¡Último dato! ¿Cuál es tu *disponibilidad horaria* aproximada para que te contacte un asesor?",
+        "fin":  "Perfecto, con todos estos datos ya cuento con lo suficiente para derivarte con un asesor, muchisimas gracias por tu tiempo!",
+    }
+    return prompts.get(step, prompts["op"])
+
+def _ensure_tas_slots(slots: dict) -> dict:
+    slots.setdefault("_flow", "tasacion")
+    slots.setdefault("_tas_step", "op")
+    for k in ("tas_operacion","tas_propiedad","tas_m2","tas_direccion","tas_expensas","tas_features","tas_disponibilidad"):
+        slots.setdefault(k, None)
+    return slots
+
+def handle_tasacion(slots: dict, incoming_text: str, user_phone: str):
+    slots = _ensure_tas_slots(slots)
+    step = slots.get("_tas_step", "op")
+    text = incoming_text or ""
+
+    if step == "op":
+        op = _norm(text)
+        if "venta" in op:
+            slots["tas_operacion"] = "venta"
+            slots["_tas_step"] = "prop"
+        elif "alquiler" in op or "renta" in op:
+            slots["tas_operacion"] = "alquiler"
+            slots["_tas_step"] = "prop"
+        q = _tas_questions(slots["_tas_step"])
+        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": slots["_tas_step"]}, vendor_push=False)
+
+    if step == "prop":
+        slots["tas_propiedad"] = text.strip() or "no informado"
+        slots["_tas_step"] = "m2"
+        q = _tas_questions("m2")
+        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "m2"}, vendor_push=False)
+
+    if step == "m2":
+        m2 = parse_int(text)
+        if m2 is None:
+            q = "¿Me pasás un número aproximado de *metros cuadrados*? (ej.: 65)"
+            return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "m2"}, vendor_push=False)
+        slots["tas_m2"] = m2
+        slots["_tas_step"] = "dir"
+        q = _tas_questions("dir")
+        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "dir"}, vendor_push=False)
+
+    if step == "dir":
+        slots["tas_direccion"] = text.strip() or "no informado"
+        slots["_tas_step"] = "exp"
+        q = _tas_questions("exp")
+        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "exp"}, vendor_push=False)
+
+    if step == "exp":
+        t = _norm(text)
+        if any(w in t for w in ("no tiene", "no", "sin expensas", "sin")):
+            slots["tas_expensas"] = "no tiene"
+        else:
+            val = parse_money(text)
+            slots["tas_expensas"] = f"${val:,}".replace(",", ".") if val else (text.strip() or "no informado")
+        slots["_tas_step"] = "feat"
+        q = _tas_questions("feat")
+        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "feat"}, vendor_push=False)
+
+    if step == "feat":
+        feats = _extract_features(text)
+        slots["tas_features"] = _join_features(feats) if feats is not None else "no informado"
+        slots["_tas_step"] = "disp"
+        q = _tas_questions("disp")
+        return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "disp"}, vendor_push=False)
+
+    if step == "disp":
+        slots["tas_disponibilidad"] = text.strip() or "no informado"
+        slots["_tas_step"] = "fin"
+
+        resumen = (
+            "Tasación solicitada ✅\n"
+            f"• Operación: {slots.get('tas_operacion','N/D')}\n"
+            f"• Propiedad: {slots.get('tas_propiedad','N/D')}\n"
+            f"• Metros²: {slots.get('tas_m2','N/D')}\n"
+            f"• Dirección: {slots.get('tas_direccion','N/D')}\n"
+            f"• Expensas: {slots.get('tas_expensas','N/D')}\n"
+            f"• Extras: {slots.get('tas_features','N/D')}\n"
+            f"• Disponibilidad: {slots.get('tas_disponibilidad','N/D')}\n"
+            f"• Tel cliente: +{user_phone}"
+        )
+        closing = _tas_questions("fin")
+        # En este contrato, usamos 'text' (para el cliente) y 'vendor_message' (para el asesor).
+        return BotResponse(text=closing, next_question=None, updates={"slots": slots, "stage": "fin"}, vendor_push=True, vendor_message=resumen)
+
+    # fallback a inicio
+    slots["_tas_step"] = "op"
+    q = _tas_questions("op")
+    return BotResponse(text=q, next_question=q, updates={"slots": slots, "stage": "op"}, vendor_push=False)
+
+
 # ===========================
 # FIND PROPERTY / REPLIES (atajo de asesor)
 # ===========================
@@ -110,7 +234,7 @@ STREET_HINTS = [
     "calle", "c/", "av", "avenida", "pasaje", "pas", "pje", "ruta", "rn", "rp",
     "boulevard", "bvard", "bv", "diagonal", "diag", "esquina", "entre", "altura"
 ]
-CODIGO_RE = re.compile(r"\b([A-Z]\d{3,5})\b", re.IGNORECASE)
+CODIGO_RE = re.compile(r"\b([A-Z]\d{3})\b", re.IGNORECASE)
 
 def _normalize(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip().lower()
@@ -135,168 +259,18 @@ def _ratio(a: str, b: str) -> float:
     from difflib import SequenceMatcher
     return SequenceMatcher(None, _normalize(a), _normalize(b)).ratio()
 
-# --- Column discovery (para no romper si el schema difiere) ---
-_PROP_COLS_CACHE: Optional[List[str]] = None
-
-def get_property_columns(db: Session) -> List[str]:
-    global _PROP_COLS_CACHE
-    if _PROP_COLS_CACHE is not None:
-        return _PROP_COLS_CACHE
-    cols = []
-    try:
-        res = db.execute(sql_text("SHOW COLUMNS FROM propiedades"))
-        cols = [r[0] for r in res.fetchall()]
-    except Exception:
-        cols = []
-    _PROP_COLS_CACHE = cols
-    return cols
-
-def select_clause_for_props(cols: List[str]) -> str:
-    base = ["id", "codigo", "direccion", "zona", "precio", "dormitorios", "cochera"]
-    optional = ["operacion", "tipo_operacion", "precio_venta", "precio_alquiler", "ambientes", "tipo_propiedad", "total_construido"]
-    selected = [c for c in base if c in cols]
-    selected += [c for c in optional if c in cols]
-    if not selected:
-        selected = ["id", "codigo", "direccion", "zona"]
-    return ", ".join(selected)
-
-def get_prop_operacion(p: Dict[str, Any]) -> Optional[str]:
-    for k in ("operacion", "tipo_operacion"):
-        v = p.get(k)
-        if isinstance(v, str) and v.strip():
-            t = detect_operacion(v)
-            if t:
-                return t
-            vs = _norm(v)
-            if vs in ("venta", "alquiler"):
-                return vs
-        elif isinstance(v, (int, bool)):
-            return "venta" if int(v) == 1 else "alquiler"
-    if p.get("precio_venta") and not p.get("precio_alquiler"):
-        return "venta"
-    if p.get("precio_alquiler") and not p.get("precio_venta"):
-        return "alquiler"
-    return None
-
-# --- Helpers de links ---
-URL_RE = re.compile(r"https?://[^\s>]+", re.I)
-KNOWN_DOMAINS = {"zonaprop.com.ar", "argenprop.com", "argenprop.com.ar", "veglienzone.com.ar", "veglienzone.com"}
-
-def _extract_first_url(text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = URL_RE.search(text)
-    return m.group(0) if m else None
-
-def _domain(host: Optional[str]) -> str:
-    if not host:
-        return ""
-    host = host.lower()
-    parts = host.split(".")
-    return ".".join(parts[-3:]) if len(parts) >= 3 else host
-
-def _try_extract_codigo_from_url(url: str) -> Optional[str]:
-    try:
-        u = urlparse(url)
-        qs = parse_qs(u.query or "")
-        for key in ("codigo", "cod", "c", "id"):
-            if key in qs and qs[key]:
-                return str(qs[key][0]).strip().upper()
-        m = CODIGO_RE.search(u.path or "")
-        if m:
-            return m.group(1).upper()
-    except Exception:
-        pass
-    return None
-
-def _fetch_page_title_or_og(url: str) -> Optional[str]:
-    try:
-        r = httpx.get(
-            url,
-            timeout=4.0,
-            follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (Veglienzone-Agent)"},
-        )
-        if r.status_code >= 400 or not r.text:
-            return None
-        html = r.text
-        m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-        if m:
-            return m.group(1).strip()
-        m = re.search(r"<title>(.*?)</title>", html, re.I | re.S)
-        if m:
-            return re.sub(r"\s+", " ", m.group(1)).strip()
-    except Exception:
-        pass
-    return None
-
-def _match_address_like(db: Session, source_text: str, cols: List[str], sel: str):
-    street, number, words = _address_tokens(source_text)
-
-    if street and number and "direccion" in cols:
-        like = f"%{street.split()[0]}%{number}%"
-        res = db.execute(
-            sql_text(f"SELECT {sel} FROM propiedades WHERE direccion LIKE :like LIMIT 1"),
-            {"like": like}
-        )
-        row = res.mappings().first()
-        if row:
-            return row
-
-    if "direccion" in cols:
-        like_parts = [w for w in words if w not in {"calle", "avenida"}][:2]
-        if like_parts:
-            where = " AND ".join([f"direccion LIKE :w{i}" for i in range(len(like_parts))])
-            params = {f"w{i}": f"%{w}%" for i, w in enumerate(like_parts)}
-            res = db.execute(
-                sql_text(f"SELECT {sel} FROM propiedades WHERE {where} LIMIT 3"),
-                params
-            )
-            rows = res.mappings().all()
-            if rows:
-                best = max(rows, key=lambda r: _ratio(" ".join(words), r.get("direccion", "")))
-                return best
-
-    return None
-
 def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, Any]]:
-    """Versión extendida: también intenta con URL y título si viene un link."""
     t = _normalize(text_in or "")
-    cols = get_property_columns(db)
-    sel = select_clause_for_props(cols)
 
-    # 0) Si viene URL, probamos directo
-    url = _extract_first_url(text_in or "")
-    if url:
-        try:
-            u = urlparse(url)
-            host = _domain(u.hostname)
-            if any(host.endswith(kd) for kd in KNOWN_DOMAINS):
-                codigo = _try_extract_codigo_from_url(url)
-                if codigo:
-                    res = db.execute(
-                        sql_text(f"SELECT {sel} FROM propiedades WHERE UPPER(codigo)=:codigo LIMIT 1"),
-                        {"codigo": codigo.upper()}
-                    )
-                    row = res.mappings().first()
-                    if row:
-                        return dict(row)
-
-                # sin código → og:title/title
-                title = _fetch_page_title_or_og(url)
-                if title:
-                    maybe = _match_address_like(db, title, cols, sel)
-                    if maybe:
-                        return dict(maybe)
-        except Exception:
-            pass
-
-    # 1) Código tipo A101/B202 en texto
+    # 1) Código tipo A101/B202
     m = CODIGO_RE.search(text_in or "")
     if m:
         codigo = m.group(1).upper()
         res = db.execute(
-            sql_text(f"SELECT {sel} FROM propiedades WHERE codigo=:codigo LIMIT 1"),
+            sql_text(
+                "SELECT id, codigo, direccion, zona, precio, dormitorios, cochera "
+                "FROM propiedades WHERE codigo=:codigo LIMIT 1"
+            ),
             {"codigo": codigo}
         )
         row = res.mappings().first()
@@ -305,53 +279,62 @@ def find_property_by_user_text(db: Session, text_in: str) -> Optional[Dict[str, 
 
     # 2) Dirección aparente
     if _looks_like_address(t):
-        maybe = _match_address_like(db, text_in, cols, sel)
-        if maybe:
-            return dict(maybe)
+        street, number, words = _address_tokens(t)
+
+        if street and number:
+            like = f"%{street.split()[0]}%{number}%"
+            res = db.execute(
+                sql_text(
+                    "SELECT id, codigo, direccion, zona, precio, dormitorios, cochera "
+                    "FROM propiedades WHERE direccion LIKE :like LIMIT 1"
+                ),
+                {"like": like}
+            )
+            row = res.mappings().first()
+            if row:
+                return dict(row)
+
+        like_parts = [w for w in words if w not in {"calle", "avenida"}][:2]
+        if like_parts:
+            where = " AND ".join([f"direccion LIKE :w{i}" for i in range(len(like_parts))])
+            params = {f"w{i}": f"%{w}%" for i, w in enumerate(like_parts)}
+            res = db.execute(
+                sql_text(
+                    f"SELECT id, codigo, direccion, zona, precio, dormitorios, cochera "
+                    f"FROM propiedades WHERE {where} LIMIT 3"
+                ),
+                params
+            )
+            rows = res.mappings().all()
+            if rows:
+                best = max(rows, key=lambda r: _ratio(" ".join(words), r["direccion"]))
+                return dict(best)
 
     # 3) Zona exacta
-    if "zona" in cols:
-        zonas = db.execute(sql_text("SELECT DISTINCT zona FROM propiedades")).scalars().all()
-        for z in zonas:
-            if _normalize(z) in t:
-                res = db.execute(
-                    sql_text(f"SELECT {sel} FROM propiedades WHERE zona=:z ORDER BY precio ASC LIMIT 1"),
-                    {"z": z}
-                )
-                row = res.mappings().first()
-                if row:
-                    return dict(row)
+    zonas = db.execute(sql_text("SELECT DISTINCT zona FROM propiedades")).scalars().all()
+    for z in zonas:
+        if _normalize(z) in t:
+            res = db.execute(
+                sql_text(
+                    "SELECT id, codigo, direccion, zona, precio, dormitorios, cochera "
+                    "FROM propiedades WHERE zona=:z ORDER BY precio ASC LIMIT 1"
+                ),
+                {"z": z}
+            )
+            row = res.mappings().first()
+            if row:
+                return dict(row)
 
     return None
 
 def build_humane_property_reply(p: Dict[str, Any]) -> str:
-    cochera_txt = "con cochera" if (p.get("cochera") in (1, True, "1", "true", "sí", "si")) else "sin cochera"
-    precio = None
-    if p.get("precio"):
-        try:
-            precio = int(float(p["precio"]))
-        except Exception:
-            pass
-    if not precio and p.get("precio_alquiler"):
-        try:
-            precio = int(float(p["precio_alquiler"]))
-        except Exception:
-            pass
-    if not precio and p.get("precio_venta"):
-        try:
-            precio = int(float(p["precio_venta"]))
-        except Exception:
-            pass
-
+    cochera_txt = "con cochera" if (p.get("cochera") in (1, True)) else "sin cochera"
+    precio = int(p["precio"]) if p.get("precio") is not None else 0
     precio_txt = f"${precio:,}".replace(",", ".") if precio else "a consultar"
-    op = get_prop_operacion(p)
-    op_txt = f"• Operación: {op}\n" if op else ""
-
     return (
         "¡Genial! Sobre esa propiedad:\n"
         f"• Código: {p.get('codigo', 'N/D')}\n"
         f"• Dirección: {p.get('direccion','N/D')} ({p.get('zona','N/D')})\n"
-        f"{op_txt}"
         f"• Precio: {precio_txt}\n"
         f"• Dormitorios: {p.get('dormitorios','N/D')} – {cochera_txt}\n\n"
         "¿Querés que coordinemos una visita o te envío opciones parecidas en la zona?"
@@ -364,6 +347,7 @@ def build_vendor_summary(user_phone: str, p: Dict[str, Any], slots: Dict[str, An
         f"Dorms: {slots.get('dormitorios','N/D')} | Cochera: {slots.get('cochera','N/D')}.\n"
         "Pedir confirmación para visita o enviar comparables."
     )
+
 
 # ===========================
 # SLOTS / SESIONES
@@ -412,14 +396,14 @@ def welcome_reset_message() -> str:
         "Tip: cuando quieras reiniciar la conversación, escribí *reset* y empezamos de cero."
     )
 
+
 # ===========================
 # REQUEST / RESPONSE MODELS
 # ===========================
 class QualifyPayload(BaseModel):
-    user_phone: Optional[str] = Field(None, description="Número del cliente (solo dígitos, con código país)")
-    text: Optional[str] = Field("", description="Mensaje del cliente")
+    user_phone: str = Field(..., description="Número del cliente (solo dígitos, con código país)")
+    text: str = Field("", description="Mensaje del cliente")
     message_id: Optional[str] = Field(None, description="ID mensaje (opcional)")
-    model_config = ConfigDict(extra="allow")  # permite campos extra (Green/Twilio)
 
 class BotResponse(BaseModel):
     text: str
@@ -428,63 +412,6 @@ class BotResponse(BaseModel):
     vendor_push: Optional[bool] = None
     vendor_message: Optional[str] = None
 
-# ===========================
-# NORMALIZACIÓN DE PAYLOADS AJENOS (Green/Twilio)
-# ===========================
-def _extract_from_any_payload(p: QualifyPayload) -> Dict[str, str]:
-    """
-    Acepta formato 'propio' (user_phone, text, message_id) o crudos de Green/Twilio:
-    - Green: chatId, message, senderData.sender, messageData.textMessageData.textMessage
-    - Twilio: From, Body, SmsSid/MessageSid
-    Devuelve dict con { user_phone, text, message_id }.
-    """
-    phone = (p.user_phone or "").strip()
-    text  = (p.text or "").strip()
-    mid   = (p.message_id or "").strip()
-
-    x = getattr(p, "model_extra", {}) or {}
-
-    # PHONE
-    candidates_phone = [
-        phone,
-        str(x.get("chatId", "")),
-        str(x.get("waId", "")),
-        str(x.get("From", "")),
-        str(x.get("senderData", {}).get("sender", "")),
-    ]
-    for cand in candidates_phone:
-        if cand:
-            cand = cand.replace("whatsapp:", "").replace("@c.us", "")
-            cand = re.sub(r"\D", "", cand)
-            if cand:
-                phone = cand
-                break
-
-    # TEXT
-    candidates_text = [
-        text,
-        str(x.get("message", "")),
-        str(x.get("Body", "")),
-        str(x.get("messageData", {}).get("textMessageData", {}).get("textMessage", "")),
-    ]
-    for cand in candidates_text:
-        if cand and cand.strip():
-            text = cand.strip()
-            break
-
-    # MESSAGE ID
-    candidates_mid = [
-        mid,
-        str(x.get("idMessage", "")),
-        str(x.get("MessageSid", "")),
-        str(x.get("SmsSid", "")),
-    ]
-    for cand in candidates_mid:
-        if cand and cand.strip():
-            mid = cand.strip()
-            break
-
-    return {"user_phone": phone, "text": text, "message_id": mid}
 
 # ===========================
 # ENDPOINTS
@@ -493,39 +420,13 @@ def _extract_from_any_payload(p: QualifyPayload) -> Dict[str, str]:
 def healthz():
     return {"ok": True, "ts": now_iso()}
 
-def _enforce_operacion_with_property(slots: Dict[str, Any], prop: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Devuelve (error_msg, operacion_final).
-    - Si hay mismatch entre slots['operacion'] y la propiedad, retorna error_msg (texto para el usuario).
-    - Si no había operacion definida, la setea según la propiedad.
-    """
-    prop_op = get_prop_operacion(prop)
-    user_op = slots.get("operacion")
-
-    if prop_op and user_op and prop_op != user_op:
-        return (
-            f"La propiedad es de *{prop_op}*, pero tu búsqueda venía como *{user_op}*.\n"
-            f"¿Querés cambiar la búsqueda a *{prop_op}* para avanzar con esta ficha, o preferís que te muestre opciones de *{user_op}*?",
-            None
-        )
-    final_op = user_op or prop_op
-    return (None, final_op)
-
 @app.post("/qualify", response_model=BotResponse)
 def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
-    # Normaliza cualquier payload entrante (nuestro formato o Green/Twilio)
-    norm = _extract_from_any_payload(payload)
-    phone = norm["user_phone"]
-    text_in = norm["text"]
-    message_id = norm["message_id"]
+    phone = (payload.user_phone or "").strip()
+    text_in = (payload.text or "").strip()
 
     if not phone:
-        return BotResponse(
-            text="No pude leer tu número desde el mensaje. ¿Podés reenviarme el mensaje o escribir *reset* para empezar?",
-            next_question="Contame: ¿la búsqueda es para *alquiler* o para *venta*?",
-            updates={"error": "missing_user_phone"},
-            vendor_push=False
-        )
+        raise HTTPException(status_code=422, detail="user_phone is required")
 
     sess = get_or_create_session(db, phone)
     slots = read_slots(sess)
@@ -538,33 +439,21 @@ def qualify(payload: QualifyPayload, db: Session = Depends(get_db)):
         msg = welcome_reset_message()
         return BotResponse(text=msg, next_question=msg, updates={"slots": slots, "stage": "op"}, vendor_push=False)
 
-    # 1) ATAJO: consulta por propiedad (código, dirección/zona o LINK)
+    # 0.5) TASACIÓN – inicio o continuación del flujo (sin buscar en DB)
+    if (slots.get("_flow") == "tasacion") or _looks_like_tasacion_start(text_in):
+        slots["_flow"] = "tasacion"
+        resp = handle_tasacion(slots, text_in, phone)
+        write_slots(db, sess, resp.updates.get("slots", slots))
+        return resp
+
+    # 1) ATAJO: consulta por propiedad (código o dirección/zona)
     try:
         prop = find_property_by_user_text(db, text_in)
     except Exception:
         prop = None
 
     if prop:
-        # validar / fijar operacion en función de la propiedad
-        err, op_final = _enforce_operacion_with_property(slots, prop)
-        if err:
-            # mismatch → no empujamos al vendedor todavía
-            slots["_stage"] = "op_confirm_from_link"
-            slots["inmueble_interes"] = prop.get("codigo")
-            slots["direccion"] = slots.get("direccion") or prop.get("direccion")
-            write_slots(db, sess, slots)
-            return BotResponse(
-                text=err,
-                next_question="Decime si cambiamos la búsqueda a esa operación o preferís seguir con la original.",
-                updates={"slots": slots, "stage": "op_confirm_from_link"},
-                vendor_push=False,
-                vendor_message=None
-            )
-
-        # fijamos operacion si venía vacía y seguimos
-        if op_final:
-            slots["operacion"] = op_final
-
+        # no repreguntamos; actuamos como asesor
         slots.setdefault("zona", prop.get("zona"))
         slots.setdefault("direccion", prop.get("direccion"))
         slots["inmueble_interes"] = prop.get("codigo")
