@@ -57,11 +57,15 @@ def _s(v) -> str:
 
 def _say_menu() -> str:
     return (
-        "Gracias por contactarte con el área comercial de Veglienzone Gestión Inmobiliaria. "
-        "¿Cómo podemos ayudarte hoy?\n"
-        "1- Alquileres\n2- Ventas\n3- Tasaciones\n\n"
-        "Nota: si en cualquier momento escribís *reset*, la conversación se reinicia desde cero."
+        "¡Hola! 👋 Soy el asistente virtual de *Veglienzone Gestión Inmobiliaria*.\n"
+        "Gracias por contactarte con nosotros. ¿En qué te puedo ayudar hoy?\n\n"
+        "1️⃣ *Alquileres*\n"
+        "2️⃣ *Ventas*\n"
+        "3️⃣ *Tasaciones*\n\n"
+        "📝 Podés escribir el *número* o el *nombre* de la opción.\n"
+        "🔄 Si querés empezar de nuevo, escribí *\"reset\"*."
     )
+
 
 def _ask_zone_or_address() -> str:
     return "¿Tenés dirección o link exacto de la propiedad, o estás averiguando por una zona/barrio?"
@@ -83,11 +87,13 @@ def _ask_income_question() -> str:
 
 def _ask_guarantee_question() -> str:
     return (
-        "¿Qué *tipo de garantía* tenés?\n"
-        "1) Garantía de propietario de CABA\n"
-        "2) Seguro de caución FINAER\n"
-        "3) Ninguna de las anteriores"
+        "🤝 ¿Qué *tipo de garantía* tenés?\n"
+        "1️⃣ Garantía de propietario de CABA\n"
+        "2️⃣ Seguro de caución FINAER\n"
+        "3️⃣ Ninguna de las anteriores\n\n"
+        "✍️ *Escribí el número* de la opción que prefieras."
     )
+
 
 def _farewell() -> str:
     return "Perfecto, quedo atento a tus consultas. ¡Gracias por escribir! 😊"
@@ -756,15 +762,26 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 if _is_no(text):
                     s["stage"] = "done"
                     return QualifyOut(
-                        reply_text=("Gracias por la info. Para *alquiler* es un requisito excluyente contar con "
-                                    "*ingresos demostrables* que tripliquen el valor del alquiler. "
-                                    "Cuando cuentes con esa condición, ¡escribinos por acá y seguimos!"),
+                        reply_text=(
+                            "Gracias por la info 🙏\n"
+                            "Por el momento, para avanzar con el alquiler es necesario cumplir con *todos los requisitos* "
+                            "(*ingresos demostrables* y *garantía válida*).\n\n"
+                            "Si más adelante contás con ellos, escribinos por este mismo chat y con gusto te ayudamos 💬\n\n"
+                            "🔄 Para reiniciar la conversación, enviá *\"reset\"*."
+                        ),
                         closing_text=_farewell(),
                     )
+
                 if _is_yes(text) or re.search(r"(ingreso|recibo|demostrable|monotrib|dependencia)", nt):
                     s["last_prompt"] = "qual_guarantee"
                     return QualifyOut(reply_text=_ask_guarantee_question())
-                return QualifyOut(reply_text="¿Podés confirmarme si *contás con ingresos demostrables* que tripliquen el alquiler? Respondé *sí* o *no*.")
+                return QualifyOut(
+                    reply_text=(
+                        "Te pido un segundito 🙌 ¿Podés confirmarme si *contás con ingresos demostrables* "
+                        "que tripliquen el alquiler? Respondé *sí* o *no*, así seguimos 😉"
+                    )
+                )
+
 
             if s.get("last_prompt") == "qual_guarantee":
                 garantia = _parse_guarantee_choice(text)
