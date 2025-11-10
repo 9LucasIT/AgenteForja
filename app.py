@@ -65,10 +65,8 @@ def _ask_disponibilidad() -> str:
 
 
 def _ask_qualify_prompt(intent: str) -> str:
-    # Para alquiler, mantenemos la primera pregunta de ingresos (excluyente).
     if intent == "alquiler":
         return "Para avanzar con *alquiler*, ¿contás con *ingresos demostrables* que tripliquen el valor del alquiler?"
-    # Para venta, reemplazamos por disponibilidad (cualquier respuesta válida).
     return _ask_disponibilidad()
 
 
@@ -163,11 +161,17 @@ def _build_like_patterns(raw: str) -> List[str]:
 
 
 def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_total: int = 30) -> List[dict]:
+    """
+    Backward compatible:
+    1) intenta SELECT con 'expensas'
+    2) si falla (tabla sin columna), reintenta sin 'expensas'
+    """
     rows: List[dict] = []
     with conn.cursor() as cur:
         for pat in patterns:
             if len(rows) >= limit_total:
                 break
+            # primer intento: con expensas
             try:
                 cur.execute(
                     f"""
@@ -180,8 +184,29 @@ def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_to
                     (pat, max(5, limit_total // 3)),
                 )
                 rows.extend(cur.fetchall() or [])
+                continue
             except Exception:
-                return rows
+                # segundo intento: sin expensas (compatibilidad)
+                try:
+                    cur.execute(
+                        f"""
+                        SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                               precio_venta, precio_alquiler, total_construido
+                        FROM `{table}`
+                        WHERE direccion LIKE %s
+                        LIMIT %s
+                        """,
+                        (pat, max(5, limit_total // 3)),
+                    )
+                    batch = cur.fetchall() or []
+                    # completar clave 'expensas' con None para uniformidad
+                    for r in batch:
+                        if "expensas" not in r:
+                            r["expensas"] = None
+                    rows.extend(batch)
+                except Exception:
+                    # si también falla, seguimos al siguiente patrón
+                    pass
     return rows
 
 
@@ -211,8 +236,11 @@ def search_db_by_address(raw_text: str) -> Optional[dict]:
         except Exception:
             pass
 
-# === búsqueda por zona (para fallback de enlaces) ===
+
 def search_db_by_zone_token(token: str) -> Optional[dict]:
+    """
+    Backward compatible para columna 'expensas'.
+    """
     token = token.strip()
     if not token:
         return None
@@ -221,24 +249,45 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
         return None
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                       precio_venta, precio_alquiler, total_construido, expensas
-                FROM `{MYSQL_TABLE}`
-                WHERE zona LIKE %s
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (f"%{token}%",),
-            )
-            row = cur.fetchone()
-            return row
+            # intento con expensas
+            try:
+                cur.execute(
+                    f"""
+                    SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                           precio_venta, precio_alquiler, total_construido, expensas
+                    FROM `{MYSQL_TABLE}`
+                    WHERE zona LIKE %s
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (f"%{token}%",),
+                )
+                row = cur.fetchone()
+                return row
+            except Exception:
+                # reintento sin expensas
+                cur.execute(
+                    f"""
+                    SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                           precio_venta, precio_alquiler, total_construido
+                    FROM `{MYSQL_TABLE}`
+                    WHERE zona LIKE %s
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (f"%{token}%",),
+                )
+                row = cur.fetchone() or None
+                if row is not None and "expensas" not in row:
+                    row["expensas"] = None
+                return row
     except Exception:
         return None
     finally:
-        try: conn.close()
-        except Exception: pass
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # =============== Render ficha ===============
@@ -283,16 +332,11 @@ def _has_price(v) -> bool:
 
 
 def _fmt_expensas_guess(raw) -> str:
-    """
-    Intenta formatear expensas como ARS si es numérico; de lo contrario devuelve el texto tal cual.
-    Vacío/None -> "—"
-    """
     if raw is None:
         return "—"
     s = str(raw).strip()
     if not s or s.lower() in {"null", "none", "-", "na"}:
         return "—"
-    # quitar símbolos y espacios para detectar si es numérico
     s_clean = re.sub(r"[^\d]", "", s)
     if s_clean.isdigit() and s_clean != "":
         try:
@@ -300,16 +344,14 @@ def _fmt_expensas_guess(raw) -> str:
             return f"$ {n:,}".replace(",", ".")
         except Exception:
             pass
-    return s  # ya viene con formato (p.ej. "$ 45.000", "Consultar", etc.)
+    return s
 
 
 def render_property_card_db(row: dict, intent: str) -> str:
-    # Título y básicos
     addr = (row.get("direccion") or "Sin dirección").strip()
     zona = (row.get("zona") or "—").strip()
     tprop = (row.get("tipo_propiedad") or "Propiedad").strip()
 
-    # Amb / Dorm / Cochera (mantengo tu lógica actual)
     def _to_int_safe(v):
         try:
             if v is None:
@@ -326,7 +368,6 @@ def render_property_card_db(row: dict, intent: str) -> str:
     coch_raw = str(row.get("cochera") or "").strip().lower()
     coch_txt = "Sí" if coch_raw in {"1", "si", "sí", "true", "t", "y"} else "No"
 
-    # === VALORES DESDE BD, SIN CONVERTIR A NÚMERO ===
     precio_venta = (row.get("precio_venta") or "").strip()
     precio_alquiler = (row.get("precio_alquiler") or "").strip()
     total_construido = (row.get("total_construido") or "").strip()
@@ -339,7 +380,6 @@ def render_property_card_db(row: dict, intent: str) -> str:
         s2 = s.lower().strip()
         return s2 in {"null", "none", "-", "consultar", "0"}
 
-    # Operación + Valor: usamos el que esté cargado en la BD
     if not _is_empty(precio_alquiler):
         operacion = "alquiler"
         valor = precio_alquiler
@@ -350,16 +390,13 @@ def render_property_card_db(row: dict, intent: str) -> str:
         operacion = "—"
         valor = "Consultar"
 
-    # Superficie: usamos el texto tal cual; si viniera solo un número, agregamos m²
     if _is_empty(total_construido):
         sup_txt = "—"
     else:
         sup_txt = total_construido
-        # Si es solo número, le agrego m²
         if sup_txt.replace(".", "", 1).isdigit():
             sup_txt = f"{sup_txt} m²"
 
-    # Armado base de ficha
     ficha = (
         f"*{tprop}*\n"
         f"{addr} (Zona: {zona})\n\n"
@@ -371,7 +408,6 @@ def render_property_card_db(row: dict, intent: str) -> str:
         f"{SITE_URL}"
     )
 
-    # Nota amigable para ALQUILER (cuando aplica)
     if (intent == "alquiler") or (operacion == "alquiler"):
         ficha += "\n\n📝 *Importante:* Se realizan contratos a 24 meses con ajuste cada 3 meses por IPC."
 
@@ -379,7 +415,6 @@ def render_property_card_db(row: dict, intent: str) -> str:
 
 # === LINKS ===
 URL_RX = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
-
 STOPWORDS = {"en", "de", "del", "la", "el", "y", "a", "con", "por", "para", "un", "una", "los", "las", "—", "–"}
 
 def _extract_urls(text: str) -> List[str]:
@@ -452,7 +487,6 @@ def _parse_guarantee_choice(t: str) -> str:
         return "Caución FINAER"
     if nt.strip() in {"3", "3-", "3 -"} or "ninguna" in nt or "no tengo" in nt or "sin garantia" in nt or "sin garantía" in t.lower():
         return "Ninguna"
-    # por defecto, si menciona palabra "garantia" pero no clara, asumimos "Ninguna" para no trabar
     if "garantia" in nt or "garantía" in t.lower():
         return "Ninguna"
     return "Ninguna"
@@ -491,7 +525,7 @@ def _is_zone_search(t: str) -> bool:
     ]
     return any(re.search(p, nt) for p in patterns)
 
-# ======== Tasación (7 pasos, sin cambios) ========
+# ======== Tasación (7 pasos) ========
 def _num_from_text(t: str) -> Optional[int]:
     m = re.search(r"\b(\d{1,5})\b", t or "")
     if not m:
@@ -558,7 +592,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             brief = render_property_card_db(row_link, intent=s["intent"])
             s["prop_brief"] = brief
             s["stage"] = "show_property_asked_qualify"
-            # PRIMERA PREGUNTA según intent
             if s["intent"] == "alquiler":
                 s["last_prompt"] = "qual_income"
                 return QualifyOut(reply_text=brief + "\n\n" + _ask_income_question())
@@ -583,7 +616,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
         return QualifyOut(reply_text=_say_menu())
 
-    # ========== TASACIÓN 7 PREGUNTAS (sin cambios) ==========
+    # ========== TASACIÓN ==========
     if stage == "tas_op":
         t = _strip_accents(text)
         if "venta" in t:
@@ -658,7 +691,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             vendor_message=resumen,
             closing_text=""
         )
-    # ========== FIN TASACIÓN ==========
 
     # --- DIRECCIÓN / LINK ---
     if stage == "ask_zone_or_address":
@@ -716,14 +748,12 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                         "¿Podés confirmarme la *dirección exacta* tal como figura en la publicación?")
         )
 
-       # --- CALIFICACIÓN ---
+    # --- CALIFICACIÓN ---
     if stage == "show_property_asked_qualify":
         intent = s.get("intent", "alquiler")
         nt = _strip_accents(text)
 
-        # ==== ALQUILER: flujo en 2 pasos + disponibilidad ====
         if intent == "alquiler":
-            # Paso 1: Ingresos (excluyente)
             if s.get("last_prompt") == "qual_income":
                 if _is_no(text):
                     s["stage"] = "done"
@@ -734,41 +764,31 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                         closing_text=_farewell(),
                     )
                 if _is_yes(text) or re.search(r"(ingreso|recibo|demostrable|monotrib|dependencia)", nt):
-                    # Avanza al paso 2: garantía (no excluyente)
                     s["last_prompt"] = "qual_guarantee"
                     return QualifyOut(reply_text=_ask_guarantee_question())
-                # Si la respuesta es ambigua, repreguntamos
                 return QualifyOut(reply_text="¿Podés confirmarme si *contás con ingresos demostrables* que tripliquen el alquiler? Respondé *sí* o *no*.")
 
-            # Paso 2: Garantía (no excluyente) -> luego disponibilidad
             if s.get("last_prompt") == "qual_guarantee":
                 garantia = _parse_guarantee_choice(text)
-                s["garantia"] = garantia  # registro opcional
+                s["garantia"] = garantia
                 s["last_prompt"] = "qual_disp_alq"
                 return QualifyOut(reply_text=_ask_disponibilidad())
 
-            # Paso 3: Disponibilidad (no excluyente)
             if s.get("last_prompt") == "qual_disp_alq":
                 s["disp_alquiler"] = text.strip() or "no informado"
                 s["stage"] = "ask_handover"
                 s.pop("last_prompt", None)
-                return QualifyOut(
-                    reply_text=("Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
-                )
+                return QualifyOut(reply_text=("Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"))
 
-        # ==== VENTAS: solo disponibilidad ====
         if intent == "venta":
             if s.get("last_prompt") != "qual_disp_venta":
                 s["last_prompt"] = "qual_disp_venta"
                 return QualifyOut(reply_text=_ask_disponibilidad())
             else:
-                # Guardamos disponibilidad y avanzamos
                 s["disp_venta"] = text.strip() or "no informado"
                 s["stage"] = "ask_handover"
                 s.pop("last_prompt", None)
-                return QualifyOut(
-                    reply_text=("Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?")
-                )
+                return QualifyOut(reply_text=("Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"))
 
     # --- CONTACTO CON ASESOR ---
     if stage == "ask_handover":
@@ -776,15 +796,12 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
         if _is_yes(text):
             s["stage"] = "done"
-
-            # Disponibilidad (si fue informada)
             disp = ""
             if s.get("disp_alquiler"):
                 disp = f"Disponibilidad: {s['disp_alquiler']}\n"
             elif s.get("disp_venta"):
                 disp = f"Disponibilidad: {s['disp_venta']}\n"
 
-            # Operación y garantía (si corresponde)
             op_line = ""
             if s.get("intent"):
                 op_line = f"Operación seleccionada: {s['intent'].capitalize()}\n"
