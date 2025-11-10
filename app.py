@@ -46,6 +46,14 @@ def _strip_accents(s: str) -> str:
     nfkd = unicodedata.normalize("NFKD", s)
     return "".join(c for c in nfkd if not unicodedata.combining(c)).lower().strip()
 
+def _s(v) -> str:
+    """To-string seguro con strip (evita .strip() sobre float/Decimal/None)."""
+    try:
+        if v is None:
+            return ""
+        return str(v).strip()
+    except Exception:
+        return ""
 
 def _say_menu() -> str:
     return (
@@ -55,24 +63,19 @@ def _say_menu() -> str:
         "Nota: si en cualquier momento escribís *reset*, la conversación se reinicia desde cero."
     )
 
-
 def _ask_zone_or_address() -> str:
     return "¿Tenés dirección o link exacto de la propiedad, o estás averiguando por una zona/barrio?"
 
-
 def _ask_disponibilidad() -> str:
     return "¡Perfecto! 🕓 Antes de que te contacte nuestro asesor, ¿podrías contarme tu *disponibilidad horaria*?"
-
 
 def _ask_qualify_prompt(intent: str) -> str:
     if intent == "alquiler":
         return "Para avanzar con *alquiler*, ¿contás con *ingresos demostrables* que tripliquen el valor del alquiler?"
     return _ask_disponibilidad()
 
-
 def _ask_income_question() -> str:
     return "Para avanzar con *alquiler*, ¿contás con *ingresos demostrables* que tripliquen el valor del alquiler?"
-
 
 def _ask_guarantee_question() -> str:
     return (
@@ -81,7 +84,6 @@ def _ask_guarantee_question() -> str:
         "2) Seguro de caución FINAER\n"
         "3) Ninguna de las anteriores"
     )
-
 
 def _farewell() -> str:
     return "Perfecto, quedo atento a tus consultas. ¡Gracias por escribir! 😊"
@@ -95,13 +97,11 @@ try:
 except Exception:
     PYM_AVAILABLE = False
 
-
 def _parse_db_url(url: str):
     if not url:
         return None
     u = urlparse(url)
     return (u.hostname, u.port or 3306, u.username, u.password, (u.path or "").lstrip("/"))
-
 
 def _db_params():
     if DATABASE_URL:
@@ -114,7 +114,6 @@ def _db_params():
         "password": MYSQL_PASSWORD,
         "database": MYSQL_DB,
     }
-
 
 def _safe_connect():
     if not PYM_AVAILABLE:
@@ -135,7 +134,6 @@ def _safe_connect():
         )
     except Exception:
         return None
-
 
 def _build_like_patterns(raw: str) -> List[str]:
     text = raw.strip()
@@ -159,19 +157,13 @@ def _build_like_patterns(raw: str) -> List[str]:
             out.append(p); seen.add(p)
     return out
 
-
 def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_total: int = 30) -> List[dict]:
-    """
-    Backward compatible:
-    1) intenta SELECT con 'expensas'
-    2) si falla (tabla sin columna), reintenta sin 'expensas'
-    """
     rows: List[dict] = []
     with conn.cursor() as cur:
         for pat in patterns:
             if len(rows) >= limit_total:
                 break
-            # primer intento: con expensas
+            # intento con expensas
             try:
                 cur.execute(
                     f"""
@@ -186,7 +178,7 @@ def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_to
                 rows.extend(cur.fetchall() or [])
                 continue
             except Exception:
-                # segundo intento: sin expensas (compatibilidad)
+                # compat: sin expensas
                 try:
                     cur.execute(
                         f"""
@@ -199,16 +191,12 @@ def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_to
                         (pat, max(5, limit_total // 3)),
                     )
                     batch = cur.fetchall() or []
-                    # completar clave 'expensas' con None para uniformidad
                     for r in batch:
-                        if "expensas" not in r:
-                            r["expensas"] = None
+                        r.setdefault("expensas", None)
                     rows.extend(batch)
                 except Exception:
-                    # si también falla, seguimos al siguiente patrón
                     pass
     return rows
-
 
 def search_db_by_address(raw_text: str) -> Optional[dict]:
     conn = _safe_connect()
@@ -225,7 +213,7 @@ def search_db_by_address(raw_text: str) -> Optional[dict]:
         qn = _strip_accents(raw_text)
         best, best_score = None, 0.0
         for r in cands:
-            addr = _strip_accents(r.get("direccion") or "")
+            addr = _strip_accents(_s(r.get("direccion")))
             score = SequenceMatcher(None, qn, addr).ratio()
             if score > best_score:
                 best, best_score = r, score
@@ -236,11 +224,7 @@ def search_db_by_address(raw_text: str) -> Optional[dict]:
         except Exception:
             pass
 
-
 def search_db_by_zone_token(token: str) -> Optional[dict]:
-    """
-    Backward compatible para columna 'expensas'.
-    """
     token = token.strip()
     if not token:
         return None
@@ -249,7 +233,6 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
         return None
     try:
         with conn.cursor() as cur:
-            # intento con expensas
             try:
                 cur.execute(
                     f"""
@@ -265,7 +248,6 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
                 row = cur.fetchone()
                 return row
             except Exception:
-                # reintento sin expensas
                 cur.execute(
                     f"""
                     SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
@@ -278,16 +260,14 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
                     (f"%{token}%",),
                 )
                 row = cur.fetchone() or None
-                if row is not None and "expensas" not in row:
-                    row["expensas"] = None
+                if row is not None:
+                    row.setdefault("expensas", None)
                 return row
     except Exception:
         return None
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        try: conn.close()
+        except Exception: pass
 
 
 # =============== Render ficha ===============
@@ -302,61 +282,53 @@ def _to_int(x, default=0):
     except Exception:
         return default
 
-
 def _fmt_money(v) -> str:
     try:
         if v is None:
             return "Consultar"
-        s = str(v).strip()
+        s = _s(v)
         if s == "" or s == "0" or s.lower() in {"null", "none"}:
             return "Consultar"
-        f = float(s)
+        f = float(s.replace(".", "").replace(",", "."))
         if f <= 0:
             return "Consultar"
         return f"USD {int(f):,}".replace(",", ".")
     except Exception:
         return "Consultar"
 
-
 def _has_price(v) -> bool:
     try:
-        if v is None:
-            return False
-        s = str(v).strip()
+        s = _s(v)
         if s == "" or s.lower() in {"null", "none"}:
             return False
-        f = float(s)
+        f = float(s.replace(".", "").replace(",", "."))
         return f > 0
     except Exception:
         return False
 
-
 def _fmt_expensas_guess(raw) -> str:
     if raw is None:
         return "—"
-    s = str(raw).strip()
+    s = _s(raw)
     if not s or s.lower() in {"null", "none", "-", "na"}:
         return "—"
     s_clean = re.sub(r"[^\d]", "", s)
     if s_clean.isdigit() and s_clean != "":
         try:
-            n = int(s_clean)
+            n = int(float(s_clean))
             return f"$ {n:,}".replace(",", ".")
         except Exception:
             pass
     return s
 
-
 def render_property_card_db(row: dict, intent: str) -> str:
-    addr = (row.get("direccion") or "Sin dirección").strip()
-    zona = (row.get("zona") or "—").strip()
-    tprop = (row.get("tipo_propiedad") or "Propiedad").strip()
+    addr = _s(row.get("direccion")) or "Sin dirección"
+    zona = _s(row.get("zona")) or "—"
+    tprop = _s(row.get("tipo_propiedad")) or "Propiedad"
 
     def _to_int_safe(v):
         try:
-            if v is None:
-                return 0
-            s = str(v).strip()
+            s = _s(v)
             if s == "":
                 return 0
             return int(float(s))
@@ -365,13 +337,13 @@ def render_property_card_db(row: dict, intent: str) -> str:
 
     amb = _to_int_safe(row.get("ambientes"))
     dorm = _to_int_safe(row.get("dormitorios"))
-    coch_raw = str(row.get("cochera") or "").strip().lower()
+    coch_raw = _s(row.get("cochera")).lower()
     coch_txt = "Sí" if coch_raw in {"1", "si", "sí", "true", "t", "y"} else "No"
 
-    precio_venta = (row.get("precio_venta") or "").strip()
-    precio_alquiler = (row.get("precio_alquiler") or "").strip()
-    total_construido = (row.get("total_construido") or "").strip()
-    expensas_raw = (row.get("expensas") or "").strip()
+    precio_venta = _s(row.get("precio_venta"))
+    precio_alquiler = _s(row.get("precio_alquiler"))
+    total_construido = _s(row.get("total_construido"))
+    expensas_raw = row.get("expensas")  # puede ser numérico o texto
     expensas_txt = _fmt_expensas_guess(expensas_raw)
 
     def _is_empty(s: str) -> bool:
@@ -432,8 +404,8 @@ def _slug_to_candidate_text(url: str) -> str:
         return ""
 
 def _infer_intent_from_row(row: dict) -> Optional[str]:
-    venta = str(row.get("precio_venta") or "").strip().lower()
-    alqu = str(row.get("precio_alquiler") or "").strip().lower()
+    venta = _s(row.get("precio_venta")).lower()
+    alqu = _s(row.get("precio_alquiler")).lower()
     if alqu not in {"", "0", "null", "none", "-"}:
         return "alquiler"
     if venta not in {"", "0", "null", "none", "-"}:
@@ -525,7 +497,7 @@ def _is_zone_search(t: str) -> bool:
     ]
     return any(re.search(p, nt) for p in patterns)
 
-# ======== Tasación (7 pasos) ========
+# ======== Tasación ========
 def _num_from_text(t: str) -> Optional[int]:
     m = re.search(r"\b(\d{1,5})\b", t or "")
     if not m:
