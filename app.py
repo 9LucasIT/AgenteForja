@@ -75,7 +75,11 @@ def _ask_qualify_prompt(intent: str) -> str:
     return _ask_disponibilidad()
 
 def _ask_income_question() -> str:
-    return "Para avanzar con *alquiler*, ¿contás con *ingresos demostrables* que tripliquen el valor del alquiler?"
+    return (
+        "Para avanzar con *alquiler*, ¿contás con *ingresos demostrables* que tripliquen el valor del alquiler?\n\n"
+        "✅ *También es válido* si un familiar puede compartir su *recibo de sueldo* para acompañarte en la operación."
+    )
+
 
 def _ask_guarantee_question() -> str:
     return (
@@ -354,7 +358,7 @@ def render_property_card_db(row: dict, intent: str) -> str:
     precio_venta = _s(row.get("precio_venta"))
     precio_alquiler = _s(row.get("precio_alquiler"))
     total_construido = _s(row.get("total_construido"))
-    expensas_raw = row.get("expensas")  # puede ser numérico o texto
+    expensas_raw = row.get("expensas")
     expensas_txt = _fmt_expensas_guess(expensas_raw)
 
     def _is_empty(s: str) -> bool:
@@ -363,6 +367,7 @@ def render_property_card_db(row: dict, intent: str) -> str:
         s2 = s.lower().strip()
         return s2 in {"null", "none", "-", "consultar", "0"}
 
+    # Detectar tipo de operación
     if not _is_empty(precio_alquiler):
         operacion = "alquiler"
         valor = precio_alquiler
@@ -373,6 +378,7 @@ def render_property_card_db(row: dict, intent: str) -> str:
         operacion = "—"
         valor = "Consultar"
 
+    # Superficie
     if _is_empty(total_construido):
         sup_txt = "—"
     else:
@@ -380,21 +386,30 @@ def render_property_card_db(row: dict, intent: str) -> str:
         if sup_txt.replace(".", "", 1).isdigit():
             sup_txt = f"{sup_txt} m²"
 
+    # 🎨 Formato con emojis (válido para alquiler o venta)
     ficha = (
-        f"*{tprop}*\n"
+        f"🏡 *{tprop}*\n"
         f"{addr} (Zona: {zona})\n\n"
-        f"• Operación: {operacion.capitalize()}\n"
-        f"• Valor: {valor}\n"
-        f"• Sup. construida: {sup_txt}\n"
-        f"• Amb: {amb} | Dorm: {dorm} | Cochera: {coch_txt}\n"
-        f"• Expensas: {expensas_txt}\n\n"
-        f"{SITE_URL}"
+        f"💰 *Operación:* {operacion.capitalize()}\n"
+        f"💸 *Valor:* {valor}\n"
+        f"📏 *Superficie:* {sup_txt}\n"
+        f"🛏 *Ambientes:* {amb} | Dormitorios: {dorm}\n"
+        f"🚗 *Cochera:* {coch_txt}\n"
     )
 
+    # Si la propiedad tiene expensas (en venta puede estar vacía)
+    if expensas_txt not in {"—", "Consultar"}:
+        ficha += f"💬 *Expensas:* {expensas_txt}\n"
+
+    ficha += f"\n🌐 Más info: {SITE_URL}"
+
+    # Solo en alquileres agregamos el aviso de contrato
     if (intent == "alquiler") or (operacion == "alquiler"):
         ficha += "\n\n📝 *Importante:* Se realizan contratos a 24 meses con ajuste cada 3 meses por IPC."
 
     return ficha
+
+
 
 # === LINKS ===
 URL_RX = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
