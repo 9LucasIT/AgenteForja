@@ -172,7 +172,7 @@ def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_to
                 cur.execute(
                     f"""
                     SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                           precio_venta, precio_alquiler, total_construido
+                           precio_venta, precio_alquiler, total_construido, expensas
                     FROM `{table}`
                     WHERE direccion LIKE %s
                     LIMIT %s
@@ -224,7 +224,7 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
             cur.execute(
                 f"""
                 SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                       precio_venta, precio_alquiler, total_construido
+                       precio_venta, precio_alquiler, total_construido, expensas
                 FROM `{MYSQL_TABLE}`
                 WHERE zona LIKE %s
                 ORDER BY id DESC
@@ -282,6 +282,27 @@ def _has_price(v) -> bool:
         return False
 
 
+def _fmt_expensas_guess(raw) -> str:
+    """
+    Intenta formatear expensas como ARS si es numérico; de lo contrario devuelve el texto tal cual.
+    Vacío/None -> "—"
+    """
+    if raw is None:
+        return "—"
+    s = str(raw).strip()
+    if not s or s.lower() in {"null", "none", "-", "na"}:
+        return "—"
+    # quitar símbolos y espacios para detectar si es numérico
+    s_clean = re.sub(r"[^\d]", "", s)
+    if s_clean.isdigit() and s_clean != "":
+        try:
+            n = int(s_clean)
+            return f"$ {n:,}".replace(",", ".")
+        except Exception:
+            pass
+    return s  # ya viene con formato (p.ej. "$ 45.000", "Consultar", etc.)
+
+
 def render_property_card_db(row: dict, intent: str) -> str:
     # Título y básicos
     addr = (row.get("direccion") or "Sin dirección").strip()
@@ -309,6 +330,8 @@ def render_property_card_db(row: dict, intent: str) -> str:
     precio_venta = (row.get("precio_venta") or "").strip()
     precio_alquiler = (row.get("precio_alquiler") or "").strip()
     total_construido = (row.get("total_construido") or "").strip()
+    expensas_raw = (row.get("expensas") or "").strip()
+    expensas_txt = _fmt_expensas_guess(expensas_raw)
 
     def _is_empty(s: str) -> bool:
         if not s:
@@ -336,19 +359,23 @@ def render_property_card_db(row: dict, intent: str) -> str:
         if sup_txt.replace(".", "", 1).isdigit():
             sup_txt = f"{sup_txt} m²"
 
-    cod = row.get("id") or "—"
-
-    # Ficha final (mismo formato que ya usás)
-    return (
+    # Armado base de ficha
+    ficha = (
         f"*{tprop}*\n"
         f"{addr} (Zona: {zona})\n\n"
         f"• Operación: {operacion.capitalize()}\n"
         f"• Valor: {valor}\n"
         f"• Sup. construida: {sup_txt}\n"
         f"• Amb: {amb} | Dorm: {dorm} | Cochera: {coch_txt}\n"
-        f"• Código: {cod}\n\n"
+        f"• Expensas: {expensas_txt}\n\n"
         f"{SITE_URL}"
     )
+
+    # Nota amigable para ALQUILER (cuando aplica)
+    if (intent == "alquiler") or (operacion == "alquiler"):
+        ficha += "\n\n📝 *Importante:* Se realizan contratos a 24 meses con ajuste cada 3 meses por IPC."
+
+    return ficha
 
 # === LINKS ===
 URL_RX = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
