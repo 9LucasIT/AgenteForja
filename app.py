@@ -307,19 +307,30 @@ def _has_price(v) -> bool:
         return False
 
 def _fmt_expensas_guess(raw) -> str:
+    """
+    Formatea 'expensas' viniendo como número o texto.
+    Evita el bug de 357000.0 -> 3.570.000 parseando el primer token numérico con decimales.
+    """
     if raw is None:
         return "—"
     s = _s(raw)
     if not s or s.lower() in {"null", "none", "-", "na"}:
         return "—"
-    s_clean = re.sub(r"[^\d]", "", s)
-    if s_clean.isdigit() and s_clean != "":
+
+    # Buscar el primer número con opcional decimal, p.ej. "357000.0", "357.000,50", "357000"
+    m = re.search(r"(\d+(?:[.,]\d+)?)", s.replace(" ", ""))
+    if m:
+        token = m.group(1).replace(",", ".")  # normalizar coma decimal
         try:
-            n = int(float(s_clean))
+            val = float(token)
+            n = int(round(val))               # a entero para mostrar en ARS
             return f"$ {n:,}".replace(",", ".")
         except Exception:
             pass
+
+    # Si no se pudo parsear, devolvemos el texto crudo (sin tocar)
     return s
+
 
 def render_property_card_db(row: dict, intent: str) -> str:
     addr = _s(row.get("direccion")) or "Sin dirección"
