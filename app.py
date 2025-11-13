@@ -10,7 +10,7 @@ import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-SITE_URL = os.getenv("SITE_URL", "https://www.veglienzone.com.ar/").strip()
+SITE_URL = os.getenv("SITE_URL", "https://www.forjapropiedades.com/").strip()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "") or os.getenv("MYSQL_URL", "")
 MYSQL_HOST = os.getenv("MYSQLHOST") or os.getenv("MYSQL_HOST")
@@ -173,27 +173,28 @@ def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_to
         for pat in patterns:
             if len(rows) >= limit_total:
                 break
-            # intento con expensas
+            # intento con expensas + superficie
             try:
                 cur.execute(
                     f"""
                     SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                           precio_venta, precio_alquiler, total_construido, expensas
+                           precio_venta, precio_alquiler, total_construido, expensas, superficie
                     FROM `{table}`
                     WHERE direccion LIKE %s
                     LIMIT %s
                     """,
                     (pat, max(5, limit_total // 3)),
                 )
-                rows.extend(cur.fetchall() or [])
+                batch = cur.fetchall() or []
+                rows.extend(batch)
                 continue
             except Exception:
-                # compat: sin expensas
+                # compat: sin superficie
                 try:
                     cur.execute(
                         f"""
                         SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                               precio_venta, precio_alquiler, total_construido
+                               precio_venta, precio_alquiler, total_construido, expensas
                         FROM `{table}`
                         WHERE direccion LIKE %s
                         LIMIT %s
@@ -202,11 +203,30 @@ def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_to
                     )
                     batch = cur.fetchall() or []
                     for r in batch:
-                        r.setdefault("expensas", None)
+                        r.setdefault("superficie", None)
                     rows.extend(batch)
                 except Exception:
-                    pass
+                    # compat: sin expensas ni superficie
+                    try:
+                        cur.execute(
+                            f"""
+                            SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                                   precio_venta, precio_alquiler, total_construido
+                            FROM `{table}`
+                            WHERE direccion LIKE %s
+                            LIMIT %s
+                            """,
+                            (pat, max(5, limit_total // 3)),
+                        )
+                        batch = cur.fetchall() or []
+                        for r in batch:
+                            r.setdefault("expensas", None)
+                            r.setdefault("superficie", None)
+                        rows.extend(batch)
+                    except Exception:
+                        pass
     return rows
+
 
 def search_db_by_address(raw_text: str) -> Optional[dict]:
     conn = _safe_connect()
@@ -247,7 +267,7 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
                 cur.execute(
                     f"""
                     SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                           precio_venta, precio_alquiler, total_construido, expensas
+                           precio_venta, precio_alquiler, total_construido, expensas, superficie
                     FROM `{MYSQL_TABLE}`
                     WHERE zona LIKE %s
                     ORDER BY id DESC
@@ -258,26 +278,47 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
                 row = cur.fetchone()
                 return row
             except Exception:
-                cur.execute(
-                    f"""
-                    SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                           precio_venta, precio_alquiler, total_construido
-                    FROM `{MYSQL_TABLE}`
-                    WHERE zona LIKE %s
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (f"%{token}%",),
-                )
-                row = cur.fetchone() or None
-                if row is not None:
-                    row.setdefault("expensas", None)
-                return row
+                try:
+                    cur.execute(
+                        f"""
+                        SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                               precio_venta, precio_alquiler, total_construido, expensas
+                        FROM `{MYSQL_TABLE}`
+                        WHERE zona LIKE %s
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (f"%{token}%",),
+                    )
+                    row = cur.fetchone() or None
+                    if row is not None:
+                        row.setdefault("superficie", None)
+                    return row
+                except Exception:
+                    cur.execute(
+                        f"""
+                        SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                               precio_venta, precio_alquiler, total_construido
+                        FROM `{MYSQL_TABLE}`
+                        WHERE zona LIKE %s
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        (f"%{token}%",),
+                    )
+                    row = cur.fetchone() or None
+                    if row is not None:
+                        row.setdefault("expensas", None)
+                        row.setdefault("superficie", None)
+                    return row
     except Exception:
         return None
     finally:
-        try: conn.close()
-        except Exception: pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 
 # =============== Render ficha ===============
@@ -361,17 +402,32 @@ def render_property_card_db(row: dict, intent: str) -> str:
     coch_raw = _s(row.get("cochera")).lower()
     coch_txt = "Sí" if coch_raw in {"1", "si", "sí", "true", "t", "y"} else "No"
 
-    precio_venta = _s(row.get("precio_venta"))
-    precio_alquiler = _s(row.get("precio_alquiler"))
-    total_construido = _s(row.get("total_construido"))
+    precio_venta = row.get("precio_venta")
+    precio_alquiler = row.get("precio_alquiler")
+    total_construido = row.get("total_construido")
+    superficie_total = row.get("superficie")
     expensas_raw = row.get("expensas")
     expensas_txt = _fmt_expensas_guess(expensas_raw)
 
     def _is_empty(s: str) -> bool:
-        if not s:
+        if s is None:
             return True
-        s2 = s.lower().strip()
-        return s2 in {"null", "none", "-", "consultar", "0"}
+        s2 = str(s).lower().strip()
+        return s2 in {"", "null", "none", "-", "consultar", "0"}
+
+    def _fmt_m2(raw) -> str:
+        if raw is None:
+            return "—"
+        s = _s(raw)
+        if _is_empty(s):
+            return "—"
+        try:
+            f = float(str(s).replace(",", "."))
+            if abs(f - int(f)) < 1e-6:
+                return f"{int(f)} m²"
+            return f"{f} m²"
+        except Exception:
+            return s
 
     # Detectar tipo de operación
     if not _is_empty(precio_alquiler):
@@ -384,36 +440,31 @@ def render_property_card_db(row: dict, intent: str) -> str:
         operacion = "—"
         valor = "Consultar"
 
-    # Superficie
-    if _is_empty(total_construido):
-        sup_txt = "—"
-    else:
-        sup_txt = total_construido
-        if sup_txt.replace(".", "", 1).isdigit():
-            sup_txt = f"{sup_txt} m²"
+    sup_construida_txt = _fmt_m2(total_construido)
+    sup_total_txt = _fmt_m2(superficie_total)
 
-    # 🎨 Formato con emojis (válido para alquiler o venta)
+    # 🎨 Formato con emojis
     ficha = (
         f"🏡 *{tprop}*\n"
         f"{addr} (Zona: {zona})\n\n"
         f"💰 *Operación:* {operacion.capitalize()}\n"
         f"💸 *Valor:* {valor}\n"
-        f"📏 *Superficie:* {sup_txt}\n"
+        f"📐 *Sup. construida:* {sup_construida_txt}\n"
+        f"🌳 *Superficie total:* {sup_total_txt}\n"
         f"🛏 *Ambientes:* {amb} | Dormitorios: {dorm}\n"
         f"🚗 *Cochera:* {coch_txt}\n"
     )
 
-    # Si la propiedad tiene expensas (en venta puede estar vacía)
     if expensas_txt not in {"—", "Consultar"}:
         ficha += f"💬 *Expensas:* {expensas_txt}\n"
 
     ficha += f"\n🌐 Más info: {SITE_URL}"
 
-    # Solo en alquileres agregamos el aviso de contrato
     if (intent == "alquiler") or (operacion == "alquiler"):
         ficha += "\n\n📝 *Importante:* Se realizan contratos a 24 meses con ajuste cada 3 meses por IPC."
 
     return ficha
+
 
 
 
@@ -597,11 +648,12 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             s["prop_brief"] = brief
             s["stage"] = "show_property_asked_qualify"
             if s["intent"] == "alquiler":
-                s["last_prompt"] = "qual_income"
-                return QualifyOut(reply_text=brief + "\n\n" + _ask_income_question())
+                s["last_prompt"] = "qual_disp_alq"
+                return QualifyOut(reply_text=brief + "\n\n" + _ask_disponibilidad())
             else:
                 s["last_prompt"] = "qual_disp_venta"
                 return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt("venta"))
+
 
         if user_op or _is_valuation_intent(text):
             s["intent"] = user_op or "tasacion"
@@ -709,10 +761,11 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             s["intent"] = s.get("intent") or intent_infer
             brief = render_property_card_db(row_link, intent=s["intent"])
             s["prop_brief"] = brief
+            s["intent"] = s.get("intent") or intent_infer
             s["stage"] = "show_property_asked_qualify"
             if s["intent"] == "alquiler":
-                s["last_prompt"] = "qual_income"
-                return QualifyOut(reply_text=brief + "\n\n" + _ask_income_question())
+                s["last_prompt"] = "qual_disp_alq"
+                return QualifyOut(reply_text=brief + "\n\n" + _ask_disponibilidad())
             else:
                 s["last_prompt"] = "qual_disp_venta"
                 return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt("venta"))
@@ -738,14 +791,15 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             brief = render_property_card_db(row, intent=intent_infer)
             s["prop_row"] = row
             s["prop_brief"] = brief
-            s["intent"] = intent_infer
+            s["intent"] = s.get("intent") or intent_infer
             s["stage"] = "show_property_asked_qualify"
             if s["intent"] == "alquiler":
-                s["last_prompt"] = "qual_income"
-                return QualifyOut(reply_text=brief + "\n\n" + _ask_income_question())
+                s["last_prompt"] = "qual_disp_alq"
+                return QualifyOut(reply_text=brief + "\n\n" + _ask_disponibilidad())
             else:
                 s["last_prompt"] = "qual_disp_venta"
                 return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt("venta"))
+
 
         return QualifyOut(
             reply_text=("No pude identificar la ficha a partir del texto. "
@@ -753,47 +807,18 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         )
 
     # --- CALIFICACIÓN ---
-    if stage == "show_property_asked_qualify":
+        if stage == "show_property_asked_qualify":
         intent = s.get("intent", "alquiler")
-        nt = _strip_accents(text)
 
         if intent == "alquiler":
-            if s.get("last_prompt") == "qual_income":
-                if _is_no(text):
-                    s["stage"] = "done"
-                    return QualifyOut(
-                        reply_text=(
-                            "Gracias por la info 🙏\n"
-                            "Por el momento, para avanzar con el alquiler es necesario cumplir con *todos los requisitos* "
-                            "(*ingresos demostrables* y *garantía válida*).\n\n"
-                            "Si más adelante contás con ellos, escribinos por este mismo chat y con gusto te ayudamos 💬\n\n"
-                            "🔄 Para reiniciar la conversación, enviá *\"reset\"*."
-                        ),
-                        closing_text=_farewell(),
-                    )
-
-                if _is_yes(text) or re.search(r"(ingreso|recibo|demostrable|monotrib|dependencia)", nt):
-                    s["last_prompt"] = "qual_guarantee"
-                    return QualifyOut(reply_text=_ask_guarantee_question())
-                return QualifyOut(
-                    reply_text=(
-                        "Te pido un segundito 🙌 ¿Podés confirmarme si *contás con ingresos demostrables* "
-                        "que tripliquen el alquiler? Respondé *sí* o *no*, así seguimos 😉"
-                    )
-                )
-
-
-            if s.get("last_prompt") == "qual_guarantee":
-                garantia = _parse_guarantee_choice(text)
-                s["garantia"] = garantia
-                s["last_prompt"] = "qual_disp_alq"
-                return QualifyOut(reply_text=_ask_disponibilidad())
-
-            if s.get("last_prompt") == "qual_disp_alq":
-                s["disp_alquiler"] = text.strip() or "no informado"
-                s["stage"] = "ask_handover"
-                s.pop("last_prompt", None)
-                return QualifyOut(reply_text=("Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"))
+            # Para alquiler ya no filtramos por ingresos ni garantía:
+            # interpretamos este mensaje directamente como disponibilidad horaria.
+            s["disp_alquiler"] = text.strip() or "no informado"
+            s["stage"] = "ask_handover"
+            s.pop("last_prompt", None)
+            return QualifyOut(
+                reply_text="Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
+            )
 
         if intent == "venta":
             if s.get("last_prompt") != "qual_disp_venta":
@@ -803,7 +828,10 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 s["disp_venta"] = text.strip() or "no informado"
                 s["stage"] = "ask_handover"
                 s.pop("last_prompt", None)
-                return QualifyOut(reply_text=("Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"))
+                return QualifyOut(
+                    reply_text="Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
+                )
+
 
     # --- CONTACTO CON ASESOR ---
     if stage == "ask_handover":
