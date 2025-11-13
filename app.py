@@ -10,7 +10,8 @@ import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-SITE_URL = os.getenv("SITE_URL", "https://www.forjapropiedades.com/").strip()
+# Link fijo a Forja (para que nunca aparezca veglienzone)
+SITE_URL = "https://www.forjapropiedades.com/"
 
 DATABASE_URL = os.getenv("DATABASE_URL", "") or os.getenv("MYSQL_URL", "")
 MYSQL_HOST = os.getenv("MYSQLHOST") or os.getenv("MYSQL_HOST")
@@ -57,7 +58,7 @@ def _s(v) -> str:
 
 def _say_menu() -> str:
     return (
-        "¡Hola! 👋 Soy el asistente virtual de *Forja Gestión Inmobiliaria*.\n"
+        "¡Hola! 👋 Soy el asistente virtual de *Forja Propiedades*.\n"
         "Gracias por contactarte con nosotros. ¿En qué te puedo ayudar hoy?\n\n"
         "1️⃣ *Alquileres*\n"
         "2️⃣ *Ventas*\n"
