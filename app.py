@@ -597,9 +597,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         row_link = _try_property_from_link_or_slug(text)
         if row_link:
             prop_op = _infer_intent_from_row(row_link) or "venta"
-            if user_op and user_op != prop_op:
-                _reset(chat_id)
-                return QualifyOut(reply_text=_mismatch_msg(user_op, prop_op))
+            # ya no validamos mismatch: usamos el intent del usuario si lo hubo, si no el de la propiedad
             s["prop_row"] = row_link
             s["intent"] = user_op or prop_op
             brief = render_property_card_db(row_link, intent=s["intent"])
@@ -710,10 +708,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         row_link = _try_property_from_link_or_slug(text)
         if row_link:
             intent_infer = _infer_intent_from_row(row_link) or s.get("intent") or "venta"
-            if s.get("intent") and s["intent"] != intent_infer:
-                user_op = s["intent"]
-                _reset(chat_id)
-                return QualifyOut(reply_text=_mismatch_msg(user_op, intent_infer))
+            # sin validación de mismatch
             s["prop_row"] = row_link
             s["intent"] = s.get("intent") or intent_infer
             brief = render_property_card_db(row_link, intent=s["intent"])
@@ -740,10 +735,7 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
         if row:
             intent_infer = _infer_intent_from_row(row) or intent
-            if s.get("intent") and s["intent"] != intent_infer:
-                user_op = s["intent"]
-                _reset(chat_id)
-                return QualifyOut(reply_text=_mismatch_msg(user_op, intent_infer))
+            # sin validación de mismatch
             brief = render_property_card_db(row, intent=intent_infer)
             s["prop_row"] = row
             s["prop_brief"] = brief
