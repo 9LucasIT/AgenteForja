@@ -57,7 +57,7 @@ def _s(v) -> str:
 
 def _say_menu() -> str:
     return (
-        "¡Hola! 👋 Soy el asistente virtual de *Veglienzone Gestión Inmobiliaria*.\n"
+        "¡Hola! 👋 Soy el asistente virtual de *Forja Gestión Inmobiliaria*.\n"
         "Gracias por contactarte con nosotros. ¿En qué te puedo ayudar hoy?\n\n"
         "1️⃣ *Alquileres*\n"
         "2️⃣ *Ventas*\n"
