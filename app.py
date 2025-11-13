@@ -807,19 +807,28 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         )
 
     # --- CALIFICACIÓN ---
-        if stage == "show_property_asked_qualify":
+            if stage == "show_property_asked_qualify":
+        # En este stage ya mostramos la ficha de la propiedad y ahora
+        # necesitamos terminar de calificar al lead.
+
         intent = s.get("intent", "alquiler")
 
+        # 🔹 PARA ALQUILER:
+        # Ya NO preguntamos ingresos ni garantía.
+        # El mensaje que llega acá lo tomamos como disponibilidad horaria
+        # y pasamos directamente a la derivación al asesor.
         if intent == "alquiler":
-            # Para alquiler ya no filtramos por ingresos ni garantía:
-            # interpretamos este mensaje directamente como disponibilidad horaria.
             s["disp_alquiler"] = text.strip() or "no informado"
             s["stage"] = "ask_handover"
-            s.pop("last_prompt", None)
+            s["last_prompt"] = "handover"
             return QualifyOut(
                 reply_text="Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
             )
 
+        # 🔹 PARA VENTA:
+        # Mantenemos la lógica de antes:
+        # 1) Primero pedimos disponibilidad.
+        # 2) Luego, con la respuesta, pasamos a ask_handover.
         if intent == "venta":
             if s.get("last_prompt") != "qual_disp_venta":
                 s["last_prompt"] = "qual_disp_venta"
@@ -827,10 +836,11 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             else:
                 s["disp_venta"] = text.strip() or "no informado"
                 s["stage"] = "ask_handover"
-                s.pop("last_prompt", None)
+                s["last_prompt"] = "handover"
                 return QualifyOut(
                     reply_text="Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"
                 )
+
 
 
     # --- CONTACTO CON ASESOR ---
