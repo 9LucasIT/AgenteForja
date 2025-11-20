@@ -1,4 +1,3 @@
-# app.py
 import os
 import re
 import unicodedata
@@ -576,6 +575,14 @@ def _ensure_session(chat_id: str):
 async def qualify(body: QualifyIn) -> QualifyOut:
     chat_id = body.chatId
     text = (body.message or "").strip()
+
+    # 🔒 1) NO responder a mensajes enviados por el propio bot
+    if body.isFromMe:
+        return QualifyOut(reply_text="", vendor_push=False, vendor_message="", closing_text="")
+
+    # 🔕 2) Ignorar notificaciones/eventos sin texto
+    if not text:
+        return QualifyOut(reply_text="", vendor_push=False, vendor_message="", closing_text="")
 
     _ensure_session(chat_id)
     s = STATE[chat_id]
