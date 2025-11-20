@@ -1,3 +1,4 @@
+# app.py
 import os
 import re
 import unicodedata
@@ -376,16 +377,22 @@ def render_property_card_db(row: dict, intent: str) -> str:
         s2 = s.lower().strip()
         return s2 in {"null", "none", "-", "consultar", "0"}
 
-    # Detectar tipo de operación
-    if not _is_empty(precio_alquiler):
+    if intent == "alquiler":
         operacion = "alquiler"
-        valor = precio_alquiler
-    elif not _is_empty(precio_venta):
+        valor = precio_alquiler if not _is_empty(precio_alquiler) else "Consultar"
+    elif intent == "venta":
         operacion = "venta"
-        valor = precio_venta
+        valor = precio_venta if not _is_empty(precio_venta) else "Consultar"
     else:
-        operacion = "—"
-        valor = "Consultar"
+        if not _is_empty(precio_alquiler):
+            operacion = "alquiler"
+            valor = precio_alquiler
+        elif not _is_empty(precio_venta):
+            operacion = "venta"
+            valor = precio_venta
+        else:
+            operacion = "—"
+            valor = "Consultar"
 
     def _fmt_m2(val) -> str:
         s = _s(val)
@@ -399,7 +406,6 @@ def render_property_card_db(row: dict, intent: str) -> str:
     total_construido_txt = _fmt_m2(total_construido_raw)
     superficie_txt = _fmt_m2(superficie_raw)
 
-    # 🎨 Formato con emojis (válido para alquiler o venta)
     ficha = (
         f"🏡 *{tprop}*\n"
         f"{addr} (Zona: {zona})\n\n"
@@ -411,14 +417,12 @@ def render_property_card_db(row: dict, intent: str) -> str:
         f"🚗 *Cochera:* {coch_txt}\n"
     )
 
-    # Si la propiedad tiene expensas (en venta puede estar vacía)
     if expensas_txt not in {"—", "Consultar"}:
         ficha += f"💬 *Expensas:* {expensas_txt}\n"
 
     ficha += f"\n🌐 Más info: {SITE_URL}"
 
-    # Solo en alquileres agregamos el aviso de contrato
-    if (intent == "alquiler") or (operacion == "alquiler"):
+    if intent == "alquiler":
         ficha += "\n\n📝 *Importante:* Se realizan contratos a 24 meses con ajuste cada 3 meses por IPC."
 
     return ficha
@@ -473,7 +477,6 @@ def _try_property_from_link_or_slug(text: str) -> Optional[dict]:
                     return row2
     return None
 
-# === Validación operación vs propiedad ===
 def _mismatch_msg(user_op: str, prop_op: str) -> str:
     return (
         f"Atenti 👀 La propiedad que enviaste está publicada para *{prop_op}*, "
@@ -482,7 +485,6 @@ def _mismatch_msg(user_op: str, prop_op: str) -> str:
         + _say_menu()
     )
 
-# === YES/NO y parsing guarantee ===
 def _is_yes(t: str) -> bool:
     t = _strip_accents(t)
     return t in {"si", "sí", "ok", "dale", "claro", "perfecto", "de una", "si, claro", "listo", "afirmativo"}
@@ -503,7 +505,6 @@ def _parse_guarantee_choice(t: str) -> str:
         return "Ninguna"
     return "Ninguna"
 
-# =============== Intents básicos ===============
 def _wants_reset(t: str) -> bool:
     t = _strip_accents(t)
     return t in {"reset", "reiniciar", "restart"}
@@ -537,7 +538,6 @@ def _is_zone_search(t: str) -> bool:
     ]
     return any(re.search(p, nt) for p in patterns)
 
-# ======== Tasación ========
 def _num_from_text(t: str) -> Optional[int]:
     m = re.search(r"\b(\d{1,5})\b", t or "")
     if not m:
@@ -562,7 +562,6 @@ def _money_from_text(t: str) -> Optional[int]:
 def _has_addr_number_strict(t: str) -> bool:
     return bool(re.search(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ\.]{3,}\s+\d{1,6}", t or ""))
 
-# =============== Conversación y estado ===============
 def _reset(chat_id: str):
     STATE[chat_id] = {"stage": "menu"}
 
@@ -576,23 +575,9 @@ async def qualify(body: QualifyIn) -> QualifyOut:
     chat_id = body.chatId
     text = (body.message or "").strip()
 
-    # 🔒 NO responder a mensajes enviados por el propio bot
+    # Ignorar mensajes enviados por el propio bot
     if body.isFromMe:
-        return QualifyOut(
-            reply_text="",
-            vendor_push=False,
-            vendor_message="",
-            closing_text=""
-        )
-
-    # 🔕 Ignorar eventos sin texto (notificaciones raras de Green)
-    if not text:
-        return QualifyOut(
-            reply_text="",
-            vendor_push=False,
-            vendor_message="",
-            closing_text=""
-        )
+        return QualifyOut(reply_text="", vendor_push=False, vendor_message="", closing_text="")
 
     _ensure_session(chat_id)
     s = STATE[chat_id]
@@ -603,18 +588,15 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
     stage = s.get("stage", "menu")
 
-    # --- MENU ---
     if stage == "menu":
         if not text:
             return QualifyOut(reply_text=_say_menu())
 
         user_op = "alquiler" if _is_rental_intent(text) else "venta" if _is_sale_intent(text) else None
 
-        # LINK directo en el primer mensaje
         row_link = _try_property_from_link_or_slug(text)
         if row_link:
             prop_op = _infer_intent_from_row(row_link) or "venta"
-            # ya no validamos mismatch: usamos el intent del usuario si lo hubo, si no el de la propiedad
             s["prop_row"] = row_link
             s["intent"] = user_op or prop_op
             brief = render_property_card_db(row_link, intent=s["intent"])
@@ -644,7 +626,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
         return QualifyOut(reply_text=_say_menu())
 
-    # ========== TASACIÓN ==========
     if stage == "tas_op":
         t = _strip_accents(text)
         if "venta" in t:
@@ -720,12 +701,10 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             closing_text=""
         )
 
-    # --- DIRECCIÓN / LINK ---
     if stage == "ask_zone_or_address":
         row_link = _try_property_from_link_or_slug(text)
         if row_link:
             intent_infer = _infer_intent_from_row(row_link) or s.get("intent") or "venta"
-            # sin validación de mismatch
             s["prop_row"] = row_link
             s["intent"] = s.get("intent") or intent_infer
             brief = render_property_card_db(row_link, intent=s["intent"])
@@ -752,7 +731,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
         if row:
             intent_infer = _infer_intent_from_row(row) or intent
-            # sin validación de mismatch
             brief = render_property_card_db(row, intent=intent_infer)
             s["prop_row"] = row
             s["prop_brief"] = brief
@@ -770,7 +748,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                         "¿Podés confirmarme la *dirección exacta* tal como figura en la publicación?")
         )
 
-    # --- CALIFICACIÓN ---
     if stage == "show_property_asked_qualify":
         intent = s.get("intent", "alquiler")
         nt = _strip_accents(text)
@@ -797,7 +774,6 @@ async def qualify(body: QualifyIn) -> QualifyOut:
                 s.pop("last_prompt", None)
                 return QualifyOut(reply_text=("Perfecto 😊 ¿Querés que te contacte un asesor humano por este WhatsApp para avanzar?"))
 
-    # --- CONTACTO CON ASESOR ---
     if stage == "ask_handover":
         s.pop("last_prompt", None)
 
