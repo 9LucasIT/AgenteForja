@@ -978,23 +978,21 @@ async def qualify_endpoint(body: QualifyIn) -> QualifyOut:
 
 @app.post("/webhook")
 async def green_webhook(payload: dict):
+    """
+    Endpoint para recibir webhooks DIRECTO desde Green API.
+    """
+
     print("=== RAW WEBHOOK PAYLOAD ===")
     print(payload)
 
-    """
-    Endpoint para recibir webhooks DIRECTO desde Green API.
-    Configurá en la consola de Green:
-        incomingWebhook = https://TU-APP.railway.app/webhook
-    """
-
     type_webhook = payload.get("typeWebhook")
 
-    # Solo procesamos mensajes entrantes de texto
+    # Solo procesamos mensajes entrantes
     if type_webhook != "incomingMessageReceived":
         return {"status": "ignored"}
 
-    sender = (payload.get("senderData") or {}) or {}
-    msg_data = (payload.get("messageData") or {}) or {}
+    sender = payload.get("senderData") or {}
+    msg_data = payload.get("messageData") or {}
 
     chat_id = sender.get("chatId") or sender.get("sender")
     sender_name = (
@@ -1004,38 +1002,50 @@ async def green_webhook(payload: dict):
         or ""
     )
 
+    # ===========================
+    # EXTRAER TEXTO DE CUALQUIER TIPO
+    # ===========================
     text = ""
-    # Extraer texto desde cualquier tipo de mensaje
-text = ""
 
-if msg_data.get("textMessageData"):
-    text = msg_data["textMessageData"].get("textMessage", "") or ""
+    # Tipo estándar
+    if msg_data.get("textMessageData"):
+        text = msg_data["textMessageData"].get("textMessage", "") or ""
 
-elif msg_data.get("extendedTextMessageData"):
-    text = msg_data["extendedTextMessageData"].get("textMessage", "") or ""
+    # Tipo extendido (Green API lo usa mucho)
+    elif msg_data.get("extendedTextMessageData"):
+        text = msg_data["extendedTextMessageData"].get("textMessage", "") or ""
 
-elif msg_data.get("chatMessage"):
-    # algunos formatos nuevos de Green
-    text = msg_data["chatMessage"].get("body", "") or ""
+    # Tipos nuevos (Green API los usa en grupos)
+    elif msg_data.get("chatMessage"):
+        text = msg_data["chatMessage"].get("body", "") or ""
 
-# Si sigue vacío, ignoramos
-if not text.strip():
-    return {"status": "no_text"}
+    # Si aún no hay texto → ignoramos
+    if not text or not text.strip():
+        return {"status": "no_text"}
 
+    # ===========================
+    # PROCESAR MENSAJE NORMAL
+    # ===========================
 
-    if not chat_id or not text.strip():
-        return {"status": "no_chat_or_text"}
+    body = QualifyIn(
+        chatId=chat_id,
+        message=text,
+        isFromMe=False,
+        senderName=sender_name
+    )
 
-    body = QualifyIn(chatId=chat_id, message=text, isFromMe=False, senderName=sender_name)
     out = _process_qualify(body)
+
+    # IA – reescritura humana
     out.reply_text = _rewrite_with_llama(chat_id, text, out.reply_text)
 
-    # Respuesta al cliente
+    # Responder al usuario
     if out.reply_text:
         await send_whatsapp_message(chat_id, out.reply_text)
 
-    # Derivación al vendedor
+    # Derivación al asesor
     if out.vendor_push and out.vendor_message and VENDOR_CHAT_ID:
         await send_whatsapp_message(VENDOR_CHAT_ID, out.vendor_message)
 
     return {"status": "ok"}
+
