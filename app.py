@@ -12,6 +12,7 @@ from groq import Groq
 
 
 # ==================== CONFIG BÁSICA ====================
+print("=== IA FORJA ACTIVE ===")
 
 SITE_URL = os.getenv("SITE_URL", "https://www.fincasdeleste.com.uy/")
 
