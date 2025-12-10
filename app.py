@@ -843,6 +843,7 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
                 "¿Podés confirmarme la *dirección exacta* tal como figura en la publicación?"
             )
         )
+        
 
     # --- MOSTRAR PROPIEDAD Y CALIFICAR ---
     if stage == "show_property_asked_qualify":
