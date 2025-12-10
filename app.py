@@ -978,6 +978,9 @@ async def qualify_endpoint(body: QualifyIn) -> QualifyOut:
 
 @app.post("/webhook")
 async def green_webhook(payload: dict):
+    print("=== RAW WEBHOOK PAYLOAD ===")
+    print(payload)
+
     """
     Endpoint para recibir webhooks DIRECTO desde Green API.
     Configurá en la consola de Green:
@@ -1002,11 +1005,23 @@ async def green_webhook(payload: dict):
     )
 
     text = ""
-    if msg_data.get("typeMessage") == "textMessage":
-        text = (msg_data.get("textMessageData") or {}).get("textMessage", "") or ""
-    else:
-        # si no es texto, por ahora ignoramos
-        return {"status": "no_text"}
+    # Extraer texto desde cualquier tipo de mensaje
+text = ""
+
+if msg_data.get("textMessageData"):
+    text = msg_data["textMessageData"].get("textMessage", "") or ""
+
+elif msg_data.get("extendedTextMessageData"):
+    text = msg_data["extendedTextMessageData"].get("textMessage", "") or ""
+
+elif msg_data.get("chatMessage"):
+    # algunos formatos nuevos de Green
+    text = msg_data["chatMessage"].get("body", "") or ""
+
+# Si sigue vacío, ignoramos
+if not text.strip():
+    return {"status": "no_text"}
+
 
     if not chat_id or not text.strip():
         return {"status": "no_chat_or_text"}
