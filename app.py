@@ -42,6 +42,13 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 LLAMA_MODEL = os.getenv("LLAMA_MODEL", "llama3-70b-8192")
 groq_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
+print("#########################")
+print("GROQ_API_KEY RAW VALUE:", repr(GROQ_API_KEY))
+print("GROQ_API_KEY LENGTH:", len(GROQ_API_KEY) if GROQ_API_KEY else 0)
+print("CLIENT CREATED:", groq_client is not None)
+print("#########################")
+
+
 # Estado en memoria
 STATE: Dict[str, Dict[str, Any]] = {}
 
