@@ -986,21 +986,33 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
 # ==================== ENVÍO A WHATSAPP (GREEN API) ====================
 
 async def send_whatsapp_message(chat_id: str, text: str):
+    print("### INTENTO DE ENVÍO A WHATSAPP ###")
+    print("chat_id:", chat_id)
+    print("mensaje:", text)
+
     if not text or not chat_id:
+        print("ERROR: faltan datos")
         return
+
     if not (GREEN_INSTANCE_ID and GREEN_API_TOKEN):
-        # sin credenciales no hacemos nada
+        print("ERROR: faltan credenciales de Green")
         return
 
     url = f"{GREEN_API_URL}/waInstance{GREEN_INSTANCE_ID}/sendMessage/{GREEN_API_TOKEN}"
     payload = {"chatId": chat_id, "message": text}
 
+    print("URL:", url)
+    print("Payload:", payload)
+
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            await client.post(url, json=payload)
-    except Exception:
-        # en producción podrías loguear el error
-        pass
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(url, json=payload)
+            print("RESPUESTA GREEN STATUS:", r.status_code)
+            print("RESPUESTA GREEN BODY:", r.text)
+
+    except Exception as e:
+        print("ERROR ENVIANDO MENSAJE A GREEN:", e)
+
 
 
 # ==================== ENDPOINT /qualify (para pruebas) ====================
