@@ -596,30 +596,28 @@ def _rewrite_with_llama(chat_id: str, user_text: str, base_reply: str) -> str:
     print("LLAMA - Entrando a rewrite")
     print("LLAMA - base_reply:", base_reply)
 
-    # Si no hay mensaje, devolvemos tal cual
     if not base_reply:
-        print("LLAMA - base_reply vacío")
+        print("LLAMA - base_reply vacío → devuelvo tal cual")
         return base_reply
 
-    # Si no hay cliente Groq, devolvemos tal cual
     if groq_client is None:
-        print("LLAMA - groq_client es None")
+        print("LLAMA - groq_client es None → devuelvo base_reply")
         return base_reply
 
     state = STATE.setdefault(chat_id, {})
     history = state.setdefault("history", [])
 
     try:
+        prompt = (
+            "Sos un asistente inmobiliario argentino, cálido y claro.\n"
+            "Reescribí el siguiente mensaje haciéndolo más humano, "
+            "sin cambiar datos, cifras, direcciones ni links.\n\n"
+            f"Mensaje a mejorar:\n{base_reply}"
+        )
+
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Sos un asistente inmobiliario amable y humano. "
-                    "Mejorá el mensaje manteniendo datos, montos y links EXACTOS."
-                )
-            },
-            {"role": "user", "content": user_text},
-            {"role": "assistant", "content": base_reply}
+            {"role": "system", "content": "Sos un asistente amable y profesional."},
+            {"role": "user", "content": prompt}
         ]
 
         print("LLAMA - realizando completion con modelo:", LLAMA_MODEL)
@@ -633,6 +631,10 @@ def _rewrite_with_llama(chat_id: str, user_text: str, base_reply: str) -> str:
 
         final_reply = resp.choices[0].message.content.strip()
         print("LLAMA - final_reply:", final_reply)
+
+        if not final_reply:
+            print("LLAMA - final_reply vacío → devuelvo base_reply")
+            return base_reply
 
         return final_reply
 
