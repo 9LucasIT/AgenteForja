@@ -593,106 +593,52 @@ def _ensure_session(chat_id: str):
 # ==================== MOTOR IA: REESCRIBIR RESPUESTA ====================
 
 def _rewrite_with_llama(chat_id: str, user_text: str, base_reply: str) -> str:
-    """
-    Usa LLaMA-3 (Groq) para generar una respuesta conversacional y humana,
-    usando el flujo (_process_qualify) solo como guía.
-    Mantiene datos numéricos, direcciones y links, pero puede reescribir
-    completamente el texto para que suene natural.
-    """
-    state = STATE.setdefault(chat_id, {})
-    history: List[Dict[str, str]] = state.setdefault("history", [])
+    print("LLAMA - Entrando a rewrite")
+    print("LLAMA - base_reply:", base_reply)
 
-    # Si no hay IA o no hay respuesta base, salimos rápido
-    if not base_reply or groq_client is None or not GROQ_API_KEY:
-        if user_text:
-            history.append({"role": "user", "content": user_text})
-        if base_reply:
-            history.append({"role": "assistant", "content": base_reply})
-        state["history"] = history[-20:]
+    state = STATE.setdefault(chat_id, {})
+    history = state.setdefault("history", [])
+
+    # Si no hay IA, devolvemos base_reply
+    if not base_reply:
+        print("LLAMA - base_reply vacío, devolviendo tal cual")
         return base_reply
 
-    stage = state.get("stage", "menu")
-    intent = state.get("intent") or "no definido"
-
-    # Links detectados en el mensaje del usuario o en la respuesta base
-    urls = _extract_urls((user_text or "") + " " + (base_reply or ""))
-    has_link = bool(urls)
-
-    # Resumen cortito del estado para la IA
-    resumen_estado = [
-        f"Etapa actual del flujo interno: {stage}.",
-        f"Intención principal: {intent}.",
-    ]
-    if state.get("tas_op"):
-        resumen_estado.append(f"Operación de tasación: {state.get('tas_op')}.")
-    if state.get("tas_m2"):
-        resumen_estado.append(f"Metros cuadrados mencionados: {state.get('tas_m2')}.")
-    if state.get("tas_dir"):
-        resumen_estado.append(f"Dirección cargada para tasación: {state.get('tas_dir')}.")
-
-    if has_link:
-        resumen_estado.append(f"El usuario envió estos links: {', '.join(urls)}.")
-
-    estado_texto = "\n".join(resumen_estado)
-
-    system_msg = (
-        "Sos un asistente virtual inmobiliario argentino, profesional pero cercano.\n"
-        "Usás un flujo interno (etapas de menú, tasación, alquiler, venta, derivación) "
-        "solo como guía, pero VOS redactás la respuesta final de forma natural.\n\n"
-        "Instrucciones IMPORTANTES:\n"
-        "- Usá el *mensaje base* y el *estado del flujo* como guía de qué temas cubrir, "
-        "pero podés reescribir el texto por completo para que suene conversacional.\n"
-        "- Mantené SIEMPRE correctos los datos numéricos, montos de dinero, metros cuadrados, "
-        "direcciones, nombres de zonas y URLs. No inventes propiedades, precios ni condiciones.\n"
-        "- Podés agregar pequeñas frases de empatía o una pregunta de seguimiento si tiene sentido.\n"
-        "- Respondé SIEMPRE en español rioplatense, tono profesional pero humano.\n"
-        "- Si el usuario envía un link (aunque sea de Argenprop, Zonaprop u otra página externa), "
-        "no digas que lo analizaste internamente; en cambio, reconocé que es un link de una propiedad "
-        "y preguntale qué quiere que le aclares o si busca algo similar.\n"
-        "- No alargues innecesariamente la respuesta; apuntá a 2–5 líneas salvo que el contexto necesite más."
-    )
-
-    # Construimos los mensajes para la IA
-    messages = [{"role": "system", "content": system_msg}]
-
-    # Un poco de contexto de conversación previa (recortado)
-    for h in history[-6:]:
-        messages.append(h)
-
-    # Mensaje del usuario actual
-    if user_text:
-        messages.append({"role": "user", "content": user_text})
-
-    # Contexto estructurado + mensaje base como guía
-    contexto = (
-        "Contexto del flujo interno y mensaje base para que lo tengas como referencia:\n\n"
-        f"{estado_texto}\n\n"
-        "Mensaje base generado por la lógica del flujo (no lo repitas tal cual, usalo solo como guía):\n"
-        f"{base_reply}"
-    )
-
-    messages.append({"role": "assistant", "content": contexto})
+    if groq_client is None:
+        print("LLAMA - groq_client es None, devolviendo base_reply")
+        return base_reply
 
     try:
-        completion = groq_client.chat.completions.create(
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Sos un asistente inmobiliario amable. "
+                    "Mejorá ligeramente el mensaje sin cambiar datos, montos ni links."
+                )
+            },
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": base_reply}
+        ]
+
+        print("LLAMA - realizando completion con modelo:", LLAMA_MODEL)
+
+        resp = groq_client.chat.completions.create(
             model=LLAMA_MODEL,
             messages=messages,
-            max_tokens=400,
-            temperature=0.7,
+            max_tokens=200,
+            temperature=0.4
         )
-        final_reply = completion.choices[0].message.content.strip()
+
+        final_reply = resp.choices[0].message.content.strip()
+        print("LLAMA - final_reply:", final_reply)
+
+        return final_reply
+
     except Exception as e:
-        print("DEBUG - ERROR GROQ:", e)
-        final_reply = base_reply
+        print("LLAMA ERROR:", repr(e))
+        return base_reply
 
-    # Guardamos historia con la respuesta ya reescrita
-    if user_text:
-        history.append({"role": "user", "content": user_text})
-    if final_reply:
-        history.append({"role": "assistant", "content": final_reply})
-
-    state["history"] = history[-20:]
-    return final_reply
 
 
 
