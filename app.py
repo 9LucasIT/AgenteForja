@@ -1,8 +1,3 @@
-print("####################################")
-print("### EJECUTANDO ESTE APP.PY NUEVO ###")
-print("####################################")
-
-
 import os
 import re
 import unicodedata
@@ -15,12 +10,11 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from groq import Groq
 
-
 # ==================== CONFIG BÁSICA ====================
 
 SITE_URL = os.getenv("SITE_URL", "https://www.fincasdeleste.com.uy/")
 
-# MySQL (igual que antes)
+# MySQL
 DATABASE_URL = os.getenv("DATABASE_URL", "") or os.getenv("MYSQL_URL", "")
 MYSQL_HOST = os.getenv("MYSQLHOST") or os.getenv("MYSQL_HOST")
 MYSQL_PORT = int(os.getenv("MYSQLPORT") or os.getenv("MYSQL_PORT") or "3306")
@@ -40,22 +34,28 @@ VENDOR_CHAT_ID = os.getenv("VENDOR_CHAT_ID", "").strip()  # ej: "5493412654593@c
 # IA - Groq / LLaMA-3
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 LLAMA_MODEL = os.getenv("LLAMA_MODEL", "llama-3.1-8b-instant")
-groq_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
+print("####################################")
+print("### EJECUTANDO ESTE APP.PY NUEVO ###")
+print("####################################")
 print("#########################")
-print("GROQ_API_KEY RAW VALUE:", repr(GROQ_API_KEY))
+print(f"GROQ_API_KEY RAW VALUE: '{GROQ_API_KEY}'")
 print("GROQ_API_KEY LENGTH:", len(GROQ_API_KEY) if GROQ_API_KEY else 0)
-print("CLIENT CREATED:", groq_client is not None)
+try:
+    groq_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+    print("CLIENT CREATED:", groq_client is not None)
+except Exception as e:
+    print("ERROR CREANDO CLIENTE GROQ:", repr(e))
+    groq_client = None
 print("#########################")
-
 
 # Estado en memoria
 STATE: Dict[str, Dict[str, Any]] = {}
 
-app = FastAPI(title="WhatsApp Inmo Agent (Forja/Fincas, sin n8n)", version="2025-12-10")
-
+app = FastAPI(title="WhatsApp Inmo Agent (Forja/Fincas, sin n8n)", version="2025-12-11")
 
 # ==================== MODELOS I/O ====================
+
 
 class QualifyIn(BaseModel):
     chatId: str
@@ -136,7 +136,7 @@ def _farewell() -> str:
     return "Perfecto, quedo atento a tus consultas. ¡Gracias por escribir! 😊"
 
 
-# ==================== DB (igual esquema anterior) ====================
+# ==================== DB ====================
 
 try:
     import pymysql
@@ -184,7 +184,8 @@ def _safe_connect():
             autocommit=True,
             charset="utf8mb4",
         )
-    except Exception:
+    except Exception as e:
+        print("ERROR DB CONNECT:", repr(e))
         return None
 
 
@@ -248,8 +249,8 @@ def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_to
                         r.setdefault("expensas", None)
                         r.setdefault("superficie", None)
                     rows.extend(batch)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print("ERROR _fetch_candidates_from_table:", repr(e))
     return rows
 
 
@@ -320,7 +321,8 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
                     row.setdefault("expensas", None)
                     row.setdefault("superficie", None)
                 return row
-    except Exception:
+    except Exception as e:
+        print("ERROR search_db_by_zone_token:", repr(e))
         return None
     finally:
         try:
@@ -546,6 +548,7 @@ def _is_zone_search(t: str) -> bool:
     nt = _strip_accents(t)
     patterns = [
         r"\bno tengo (la )?direccion\b",
+        r"\bno tengo (ninguna )?direccion\b",
         r"\bno tengo link\b",
         r"\bsolo (zona|barrio)\b",
         r"\bestoy averiguando\b",
@@ -582,7 +585,7 @@ def _has_addr_number_strict(t: str) -> bool:
 
 
 def _reset(chat_id: str):
-    STATE[chat_id] = {"stage": "menu"}
+    STATE[chat_id] = {"stage": "menu", "history": []}
 
 
 def _ensure_session(chat_id: str):
@@ -617,7 +620,7 @@ def _rewrite_with_llama(chat_id: str, user_text: str, base_reply: str) -> str:
 
         messages = [
             {"role": "system", "content": "Sos un asistente amable y profesional."},
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": prompt},
         ]
 
         print("LLAMA - realizando completion con modelo:", LLAMA_MODEL)
@@ -626,7 +629,7 @@ def _rewrite_with_llama(chat_id: str, user_text: str, base_reply: str) -> str:
             model=LLAMA_MODEL,
             messages=messages,
             max_tokens=200,
-            temperature=0.4
+            temperature=0.4,
         )
 
         final_reply = resp.choices[0].message.content.strip()
@@ -636,6 +639,12 @@ def _rewrite_with_llama(chat_id: str, user_text: str, base_reply: str) -> str:
             print("LLAMA - final_reply vacío → devuelvo base_reply")
             return base_reply
 
+        # Actualizamos historia mínima
+        if user_text:
+            history.append({"role": "user", "content": user_text})
+        history.append({"role": "assistant", "content": final_reply})
+        state["history"] = history[-20:]
+
         return final_reply
 
     except Exception as e:
@@ -643,29 +652,82 @@ def _rewrite_with_llama(chat_id: str, user_text: str, base_reply: str) -> str:
         return base_reply
 
 
+# ==================== IA PARA ZONA / DIRECCIÓN ====================
+
+def _ai_understand_zone_or_address(text: str) -> Dict[str, str]:
+    """
+    Usa Groq para decidir si el usuario habla de:
+      - direccion
+      - zona
+      - ninguno
+    y devuelve un JSON con esa info.
+    """
+    if not text or groq_client is None:
+        return {"type": "ninguno", "direccion": "", "zona": ""}
+
+    prompt = f"""
+    Analizá este mensaje del usuario y respondé SOLO un JSON válido.
+
+    Mensaje: "{text}"
+
+    Debés detectar:
+    - "type": "direccion" | "zona" | "ninguno"
+    - "direccion": texto de la dirección si hay (ej: "Corrientes 1234, piso 3")
+    - "zona": nombre del barrio o zona si hay (ej: "San Sebastián", "Centro", "Palermo")
+
+    Ejemplos:
+    - "No tengo dirección, busco algo por San Sebastián" ->
+      {{"type": "zona", "direccion": "", "zona": "San Sebastián"}}
+    - "Oficina en Corrientes 1234, CABA" ->
+      {{"type": "direccion", "direccion": "Corrientes 1234, CABA", "zona": ""}}
+    - "Solo estoy averiguando precios" ->
+      {{"type": "ninguno", "direccion": "", "zona": ""}}
+
+    Recordá: SOLO JSON, sin explicaciones.
+    """
+
+    try:
+        resp = groq_client.chat.completions.create(
+            model=LLAMA_MODEL,
+            messages=[
+                {"role": "system", "content": "Sos un analizador de intención inmobiliaria."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=200,
+            temperature=0.2,
+        )
+        content = resp.choices[0].message.content.strip()
+        print("AI_ZONE RAW:", content)
+        import json
+
+        data = json.loads(content)
+        return {
+            "type": data.get("type", "ninguno"),
+            "direccion": data.get("direccion", "") or "",
+            "zona": data.get("zona", "") or "",
+        }
+    except Exception as e:
+        print("INTENT AI ERROR:", repr(e))
+        return {"type": "ninguno", "direccion": "", "zona": ""}
 
 
-# ==================== MOTOR ORIGINAL DE CALIFICACIÓN ====================
+# ==================== MOTOR ORIGINAL DE CALIFICACIÓN (AJUSTADO) ====================
 
 def _process_qualify(body: QualifyIn) -> QualifyOut:
-    print("=== PROCESS QUALIFY ===")
-    print("chatId:", body.chatId)
-    print("message:", body.message)
-    print("isFromMe:", body.isFromMe)
-    print("STATE before:", STATE.get(body.chatId))
     chat_id = body.chatId
     text = (body.message or "").strip()
+
+    print("=== PROCESS QUALIFY ===")
+    print("chatId:", chat_id)
+    print("message:", text)
+    print("isFromMe:", body.isFromMe)
+    print("STATE before:", STATE.get(chat_id))
 
     _ensure_session(chat_id)
     s = STATE[chat_id]
 
     if _wants_reset(text):
         _reset(chat_id)
-        print("=== QUALIFY OUTPUT ===")
-        print("reply_text:", out.reply_text)
-        print("vendor_push:", out.vendor_push)
-        print("vendor_message:", out.vendor_message)
-
         return QualifyOut(reply_text=_say_menu())
 
     stage = s.get("stage", "menu")
@@ -673,18 +735,18 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
     # --- MENU ---
     if stage == "menu":
         print("MENU STAGE - TEXT RECEIVED:", text)
+        print("MENU - CHECKING USER INTENT")
+
         if not text:
-            print("MENU - EMPTY TEXT")
             return QualifyOut(reply_text=_say_menu())
 
-        print("MENU - CHECKING USER INTENT")
         user_op = "alquiler" if _is_rental_intent(text) else "venta" if _is_sale_intent(text) else None
         print("MENU - user_op:", user_op)
-        
+
         row_link = _try_property_from_link_or_slug(text)
         print("MENU - row_link:", row_link)
+
         if row_link:
-            print("MENU - FOUND LINK")
             prop_op = _infer_intent_from_row(row_link) or (user_op or "venta")
             s["prop_row"] = row_link
             s["intent"] = user_op or prop_op
@@ -699,7 +761,6 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
             )
 
         if user_op or _is_valuation_intent(text):
-            print("MENU - INTENT DETECTED")
             s["intent"] = user_op or "tasacion"
             if s["intent"] == "tasacion":
                 s["stage"] = "tas_op"
@@ -715,7 +776,7 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
                 )
             s["stage"] = "ask_zone_or_address"
             return QualifyOut(reply_text=_ask_zone_or_address())
-            
+
         print("MENU - FALLBACK MENU RETURN")
         return QualifyOut(reply_text=_say_menu())
 
@@ -815,8 +876,9 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
             closing_text="",
         )
 
-    # --- BÚSQUEDA DIRECCIÓN / ZONA ---
+    # --- BÚSQUEDA DIRECCIÓN / ZONA (MEJORADA CON IA) ---
     if stage == "ask_zone_or_address":
+        # Primero probamos link / slug como antes
         row_link = _try_property_from_link_or_slug(text)
         if row_link:
             intent_infer = _infer_intent_from_row(row_link) or s.get("intent") or "venta"
@@ -832,6 +894,61 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
                 + (_ask_disponibilidad() if s["intent"] == "alquiler" else _ask_qualify_prompt("venta"))
             )
 
+        # IA: entender si el usuario habló de ZONA o DIRECCIÓN
+        ai_info = _ai_understand_zone_or_address(text)
+        print("AI_ZONE INTERPRETATION:", ai_info)
+        ai_type = ai_info.get("type", "ninguno")
+        ai_dir = ai_info.get("direccion", "").strip()
+        ai_zona = ai_info.get("zona", "").strip()
+
+        # Si la IA detecta zona → buscamos alguna propiedad por zona
+        if ai_type == "zona" and ai_zona:
+            row_zona = search_db_by_zone_token(ai_zona)
+            if row_zona:
+                intent = s.get("intent", _infer_intent_from_row(row_zona) or "alquiler")
+                brief = render_property_card_db(row_zona, intent=intent)
+                s["prop_row"] = row_zona
+                s["prop_brief"] = brief
+                s["intent"] = intent
+                s["stage"] = "show_property_asked_qualify"
+                s["last_prompt"] = "qual_disp_alq" if intent == "alquiler" else "qual_disp_venta"
+                return QualifyOut(
+                    reply_text=(
+                        f"Te muestro una opción reciente en la zona de *{ai_zona}* que puede interesarte:\n\n"
+                        + brief
+                        + "\n\n"
+                        + (_ask_disponibilidad() if intent == "alquiler" else _ask_qualify_prompt("venta"))
+                    )
+                )
+
+            # Si no encontramos nada puntual, damos link general pero ya entendiendo la zona
+            s["stage"] = "done"
+            msg = (
+                f"Por la zona de *{ai_zona}* tenemos varias opciones publicadas.\n"
+                f"Podés ver el listado completo acá:\n{SITE_URL}\n\n"
+                "Si encontrás alguna ficha que te guste, mandame el link o el código y lo vemos juntos 🙂"
+            )
+            return QualifyOut(reply_text=msg, closing_text=_farewell())
+
+        # Si la IA detecta dirección → usamos esa dirección
+        if ai_type == "direccion" and ai_dir:
+            intent = s.get("intent", "alquiler")
+            row = search_db_by_address(ai_dir)
+            if row:
+                intent_infer = _infer_intent_from_row(row) or intent
+                brief = render_property_card_db(row, intent=intent_infer)
+                s["prop_row"] = row
+                s["prop_brief"] = brief
+                s["intent"] = intent_infer
+                s["stage"] = "show_property_asked_qualify"
+                s["last_prompt"] = "qual_disp_alq" if intent_infer == "alquiler" else "qual_disp_venta"
+                return QualifyOut(
+                    reply_text=brief
+                    + "\n\n"
+                    + (_ask_disponibilidad() if intent_infer == "alquiler" else _ask_qualify_prompt("venta"))
+                )
+
+        # Heurística vieja por si la IA no entendió bien
         if _is_zone_search(text):
             s["stage"] = "done"
             msg = (
@@ -864,7 +981,6 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
                 "¿Podés confirmarme la *dirección exacta* tal como figura en la publicación?"
             )
         )
-        
 
     # --- MOSTRAR PROPIEDAD Y CALIFICAR ---
     if stage == "show_property_asked_qualify":
@@ -953,40 +1069,37 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
 # ==================== ENVÍO A WHATSAPP (GREEN API) ====================
 
 async def send_whatsapp_message(chat_id: str, text: str):
-    print("### INTENTO DE ENVÍO A WHATSAPP ###")
-    print("chat_id:", chat_id)
-    print("mensaje:", text)
-
     if not text or not chat_id:
-        print("ERROR: faltan datos")
         return
-
     if not (GREEN_INSTANCE_ID and GREEN_API_TOKEN):
-        print("ERROR: faltan credenciales de Green")
+        print("GREEN API NO CONFIGURADO, NO SE ENVÍA MENSAJE")
         return
 
     url = f"{GREEN_API_URL}/waInstance{GREEN_INSTANCE_ID}/sendMessage/{GREEN_API_TOKEN}"
     payload = {"chatId": chat_id, "message": text}
 
+    print("### INTENTO DE ENVÍO A WHATSAPP ###")
+    print("chat_id:", chat_id)
+    print("mensaje:", text)
     print("URL:", url)
     print("Payload:", payload)
 
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(url, json=payload)
-            print("RESPUESTA GREEN STATUS:", r.status_code)
-            print("RESPUESTA GREEN BODY:", r.text)
-
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(url, json=payload)
+            print("RESPUESTA GREEN STATUS:", resp.status_code)
+            try:
+                print("RESPUESTA GREEN BODY:", resp.text)
+            except Exception:
+                pass
     except Exception as e:
-        print("ERROR ENVIANDO MENSAJE A GREEN:", e)
-
+        print("ERROR ENVIANDO WHATSAPP:", repr(e))
 
 
 # ==================== ENDPOINT /qualify (para pruebas) ====================
 
 @app.post("/qualify", response_model=QualifyOut)
 async def qualify_endpoint(body: QualifyIn) -> QualifyOut:
-    # ignore mensajes que sean del propio bot (por si alguien llama esto manualmente)
     if body.isFromMe:
         return QualifyOut(reply_text="", vendor_push=False, vendor_message="", closing_text="")
 
@@ -999,21 +1112,16 @@ async def qualify_endpoint(body: QualifyIn) -> QualifyOut:
 
 @app.post("/webhook")
 async def green_webhook(payload: dict):
-    """
-    Endpoint para recibir webhooks DIRECTO desde Green API.
-    """
-
     print("=== RAW WEBHOOK PAYLOAD ===")
     print(payload)
 
     type_webhook = payload.get("typeWebhook")
 
-    # Solo procesamos mensajes entrantes
     if type_webhook != "incomingMessageReceived":
         return {"status": "ignored"}
 
-    sender = payload.get("senderData") or {}
-    msg_data = payload.get("messageData") or {}
+    sender = (payload.get("senderData") or {}) or {}
+    msg_data = (payload.get("messageData") or {}) or {}
 
     chat_id = sender.get("chatId") or sender.get("sender")
     sender_name = (
@@ -1023,54 +1131,25 @@ async def green_webhook(payload: dict):
         or ""
     )
 
-    # ===========================
-    # EXTRAER TEXTO DE CUALQUIER TIPO
-    # ===========================
     text = ""
-
-    # Tipo estándar
-    if msg_data.get("textMessageData"):
-        text = msg_data["textMessageData"].get("textMessage", "") or ""
-
-    # Tipo extendido (Green API lo usa mucho)
-    elif msg_data.get("extendedTextMessageData"):
-        text = msg_data["extendedTextMessageData"].get("textMessage", "") or ""
-
-    # Tipos nuevos (Green API los usa en grupos)
-    elif msg_data.get("chatMessage"):
-        text = msg_data["chatMessage"].get("body", "") or ""
-
-    # Si aún no hay texto → ignoramos
-    if not text or not text.strip():
+    if msg_data.get("typeMessage") == "textMessage":
+        text = (msg_data.get("textMessageData") or {}).get("textMessage", "") or ""
+    else:
         return {"status": "no_text"}
 
-    # ===========================
-    # PROCESAR MENSAJE NORMAL
-    # ===========================
+    if not chat_id or not text.strip():
+        return {"status": "no_chat_or_text"}
 
-    body = QualifyIn(
-        chatId=chat_id,
-        message=text,
-        isFromMe=False,
-        senderName=sender_name
-    )
-
+    body = QualifyIn(chatId=chat_id, message=text, isFromMe=False, senderName=sender_name)
     out = _process_qualify(body)
-
-    # IA – reescritura humana
     out.reply_text = _rewrite_with_llama(chat_id, text, out.reply_text)
 
-    # Responder al usuario
-    if out.reply_text:
-        print("REPLY TO SEND:", out.reply_text)
+    print("REPLY TO SEND:", out.reply_text)
 
+    if out.reply_text:
         await send_whatsapp_message(chat_id, out.reply_text)
 
-    # Derivación al asesor
     if out.vendor_push and out.vendor_message and VENDOR_CHAT_ID:
-        print("REPLY TO SEND:", out.reply_text)
-
         await send_whatsapp_message(VENDOR_CHAT_ID, out.vendor_message)
 
     return {"status": "ok"}
-
