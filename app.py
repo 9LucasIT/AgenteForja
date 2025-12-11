@@ -699,6 +699,11 @@ def _rewrite_with_llama(chat_id: str, user_text: str, base_reply: str) -> str:
 # ==================== MOTOR ORIGINAL DE CALIFICACIÓN ====================
 
 def _process_qualify(body: QualifyIn) -> QualifyOut:
+    print("=== PROCESS QUALIFY ===")
+    print("chatId:", body.chatId)
+    print("message:", body.message)
+    print("isFromMe:", body.isFromMe)
+    print("STATE before:", STATE.get(body.chatId))
     chat_id = body.chatId
     text = (body.message or "").strip()
 
@@ -707,6 +712,11 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
 
     if _wants_reset(text):
         _reset(chat_id)
+        print("=== QUALIFY OUTPUT ===")
+        print("reply_text:", out.reply_text)
+        print("vendor_push:", out.vendor_push)
+        print("vendor_message:", out.vendor_message)
+
         return QualifyOut(reply_text=_say_menu())
 
     stage = s.get("stage", "menu")
@@ -1095,10 +1105,14 @@ async def green_webhook(payload: dict):
 
     # Responder al usuario
     if out.reply_text:
+        print("REPLY TO SEND:", out.reply_text)
+
         await send_whatsapp_message(chat_id, out.reply_text)
 
     # Derivación al asesor
     if out.vendor_push and out.vendor_message and VENDOR_CHAT_ID:
+        print("REPLY TO SEND:", out.reply_text)
+
         await send_whatsapp_message(VENDOR_CHAT_ID, out.vendor_message)
 
     return {"status": "ok"}
