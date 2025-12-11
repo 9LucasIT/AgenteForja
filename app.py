@@ -596,25 +596,26 @@ def _rewrite_with_llama(chat_id: str, user_text: str, base_reply: str) -> str:
     print("LLAMA - Entrando a rewrite")
     print("LLAMA - base_reply:", base_reply)
 
+    # Si no hay mensaje, devolvemos tal cual
+    if not base_reply:
+        print("LLAMA - base_reply vacío")
+        return base_reply
+
+    # Si no hay cliente Groq, devolvemos tal cual
+    if groq_client is None:
+        print("LLAMA - groq_client es None")
+        return base_reply
+
     state = STATE.setdefault(chat_id, {})
     history = state.setdefault("history", [])
-
-    # Si no hay IA, devolvemos base_reply
-    if not base_reply:
-        print("LLAMA - base_reply vacío, devolviendo tal cual")
-        return base_reply
-
-    if groq_client is None:
-        print("LLAMA - groq_client es None, devolviendo base_reply")
-        return base_reply
 
     try:
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "Sos un asistente inmobiliario amable. "
-                    "Mejorá ligeramente el mensaje sin cambiar datos, montos ni links."
+                    "Sos un asistente inmobiliario amable y humano. "
+                    "Mejorá el mensaje manteniendo datos, montos y links EXACTOS."
                 )
             },
             {"role": "user", "content": user_text},
