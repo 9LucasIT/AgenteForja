@@ -723,13 +723,19 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
 
     # --- MENU ---
     if stage == "menu":
+        print("MENU STAGE - TEXT RECEIVED:", text)
         if not text:
+            print("MENU - EMPTY TEXT")
             return QualifyOut(reply_text=_say_menu())
 
+        print("MENU - CHECKING USER INTENT")
         user_op = "alquiler" if _is_rental_intent(text) else "venta" if _is_sale_intent(text) else None
-
+        print("MENU - user_op:", user_op)
+        
         row_link = _try_property_from_link_or_slug(text)
+        print("MENU - row_link:", row_link)
         if row_link:
+            print("MENU - FOUND LINK")
             prop_op = _infer_intent_from_row(row_link) or (user_op or "venta")
             s["prop_row"] = row_link
             s["intent"] = user_op or prop_op
@@ -744,6 +750,7 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
             )
 
         if user_op or _is_valuation_intent(text):
+            print("MENU - INTENT DETECTED")
             s["intent"] = user_op or "tasacion"
             if s["intent"] == "tasacion":
                 s["stage"] = "tas_op"
@@ -759,7 +766,8 @@ def _process_qualify(body: QualifyIn) -> QualifyOut:
                 )
             s["stage"] = "ask_zone_or_address"
             return QualifyOut(reply_text=_ask_zone_or_address())
-
+            
+        print("MENU - FALLBACK MENU RETURN")
         return QualifyOut(reply_text=_say_menu())
 
     # --- TASACIÓN ---
