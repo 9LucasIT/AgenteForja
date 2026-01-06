@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel
-from groq import Groq
+
 
 
 # ==================== CONFIG BÁSICA ====================
@@ -35,7 +35,8 @@ VENDOR_CHAT_ID = os.getenv("VENDOR_CHAT_ID", "").strip()  # ej: "5493412654593@c
 # IA - Groq / LLaMA-3
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 LLAMA_MODEL = os.getenv("LLAMA_MODEL", "llama3-70b-8192")
-groq_client: Optional[Groq] = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+groq_client = Groq(api_key=GROQ_API_KEY) if Groq and GROQ_API_KEY else None
+
 
 # Estado en memoria
 STATE: Dict[str, Dict[str, Any]] = {}
