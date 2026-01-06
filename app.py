@@ -212,39 +212,49 @@ def _fetch_candidates_from_table(conn, table: str, patterns: List[str], limit_to
         for pat in patterns:
             if len(rows) >= limit_total:
                 break
+
+            # 1) intento: con expensas (y SIN superficie)
             try:
                 cur.execute(
                     f"""
                     SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                           precio_venta, precio_alquiler, total_construido, superficie, expensas
+                           precio_venta, precio_alquiler, total_construido, expensas
                     FROM `{table}`
                     WHERE direccion LIKE %s
                     LIMIT %s
                     """,
                     (pat, max(5, limit_total // 3)),
                 )
-                rows.extend(cur.fetchall() or [])
+                batch = cur.fetchall() or []
+                for r in batch:
+                    r.setdefault("superficie", None)
+                rows.extend(batch)
                 continue
             except Exception:
-                try:
-                    cur.execute(
-                        f"""
-                        SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                               precio_venta, precio_alquiler, total_construido, superficie
-                        FROM `{table}`
-                        WHERE direccion LIKE %s
-                        LIMIT %s
-                        """,
-                        (pat, max(5, limit_total // 3)),
-                    )
-                    batch = cur.fetchall() or []
-                    for r in batch:
-                        r.setdefault("expensas", None)
-                        r.setdefault("superficie", None)
-                    rows.extend(batch)
-                except Exception:
-                    pass
+                pass
+
+            # 2) fallback: sin expensas ni superficie
+            try:
+                cur.execute(
+                    f"""
+                    SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                           precio_venta, precio_alquiler, total_construido
+                    FROM `{table}`
+                    WHERE direccion LIKE %s
+                    LIMIT %s
+                    """,
+                    (pat, max(5, limit_total // 3)),
+                )
+                batch = cur.fetchall() or []
+                for r in batch:
+                    r.setdefault("expensas", None)
+                    r.setdefault("superficie", None)
+                rows.extend(batch)
+            except Exception:
+                pass
+
     return rows
+
 
 
 def search_db_by_address(raw_text: str) -> Optional[dict]:
@@ -307,17 +317,41 @@ def search_db_by_id(pid: int) -> Optional[dict]:
         return None
     try:
         with conn.cursor() as cur:
+            # 1) con expensas (sin superficie)
+            try:
+                cur.execute(
+                    f"""
+                    SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                           precio_venta, precio_alquiler, total_construido, expensas
+                    FROM `{MYSQL_TABLE}`
+                    WHERE id = %s
+                    LIMIT 1
+                    """,
+                    (pid,),
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    row.setdefault("superficie", None)
+                return row
+            except Exception:
+                pass
+
+            # 2) fallback sin expensas
             cur.execute(
                 f"""
                 SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                       precio_venta, precio_alquiler, total_construido, superficie, expensas
+                       precio_venta, precio_alquiler, total_construido
                 FROM `{MYSQL_TABLE}`
                 WHERE id = %s
-                LIMIT 1;
-            """,
+                LIMIT 1
+                """,
                 (pid,),
             )
-            return cur.fetchone()
+            row = cur.fetchone()
+            if row is not None:
+                row.setdefault("expensas", None)
+                row.setdefault("superficie", None)
+            return row
     finally:
         try:
             conn.close()
@@ -334,11 +368,12 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
         return None
     try:
         with conn.cursor() as cur:
+            # 1) con expensas (sin superficie)
             try:
                 cur.execute(
                     f"""
                     SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                           precio_venta, precio_alquiler, total_construido, superficie, expensas
+                           precio_venta, precio_alquiler, total_construido, expensas
                     FROM `{MYSQL_TABLE}`
                     WHERE zona LIKE %s
                     ORDER BY id DESC
@@ -347,24 +382,29 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
                     (f"%{token}%",),
                 )
                 row = cur.fetchone()
-                return row
-            except Exception:
-                cur.execute(
-                    f"""
-                    SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
-                           precio_venta, precio_alquiler, total_construido, superficie
-                    FROM `{MYSQL_TABLE}`
-                    WHERE zona LIKE %s
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    (f"%{token}%",),
-                )
-                row = cur.fetchone() or None
                 if row is not None:
-                    row.setdefault("expensas", None)
                     row.setdefault("superficie", None)
                 return row
+            except Exception:
+                pass
+
+            # 2) fallback sin expensas
+            cur.execute(
+                f"""
+                SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                       precio_venta, precio_alquiler, total_construido
+                FROM `{MYSQL_TABLE}`
+                WHERE zona LIKE %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (f"%{token}%",),
+            )
+            row = cur.fetchone() or None
+            if row is not None:
+                row.setdefault("expensas", None)
+                row.setdefault("superficie", None)
+            return row
     except Exception:
         return None
     finally:
@@ -372,6 +412,7 @@ def search_db_by_zone_token(token: str) -> Optional[dict]:
             conn.close()
         except Exception:
             pass
+
 
 
 # =============== Render ficha ===============
