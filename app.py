@@ -13,7 +13,7 @@ from groq import Groq
 
 # ==================== CONFIG BÁSICA ====================
 
-SITE_URL = os.getenv("SITE_URL", "https://www.fincasdeleste.com.uy/")
+SITE_URL = os.getenv("SITE_URL", "https://www.forjapropiedades.com/")
 
 # MySQL (igual que antes)
 DATABASE_URL = os.getenv("DATABASE_URL", "") or os.getenv("MYSQL_URL", "")
