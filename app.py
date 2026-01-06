@@ -1057,3 +1057,42 @@ async def qualify(body: QualifyIn) -> QualifyOut:
         return QualifyOut(
             reply_text="¿Querés que te contacte un asesor humano por este WhatsApp para avanzar? Respondé *sí* o *no*."
         )
+
+@app.get("/__dbcheck")
+def __dbcheck():
+    params = _db_params()
+    conn = _safe_connect()
+    if not conn:
+        return {
+            "ok": False,
+            "reason": "no_connect",
+            "host": params.get("host"),
+            "port": params.get("port"),
+            "user": params.get("user"),
+            "database": params.get("database"),
+            "table": MYSQL_TABLE,
+        }
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT DATABASE() AS db")
+            db_row = cur.fetchone() or {}
+
+            cur.execute(f"SELECT COUNT(*) AS n FROM `{MYSQL_TABLE}`")
+            n_row = cur.fetchone() or {}
+
+            cur.execute(f"SELECT id, direccion FROM `{MYSQL_TABLE}` ORDER BY id ASC LIMIT 5")
+            sample = cur.fetchall() or []
+
+            return {
+                "ok": True,
+                "database": db_row.get("db"),
+                "table": MYSQL_TABLE,
+                "count": n_row.get("n"),
+                "sample": sample,
+            }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
