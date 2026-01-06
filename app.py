@@ -120,18 +120,36 @@ except Exception:
 def _parse_db_url(url: str):
     if not url:
         return None
+    url = url.strip()
+
+    # Railway a veces deja URLs raras; si no hay scheme, lo agregamos
+    if "://" not in url:
+        url = "mysql://" + url
+
     u = urlparse(url)
-    return (u.hostname, u.port or 3306, u.username, u.password, (u.path or "").lstrip("/"))
+    host = u.hostname
+    port = u.port or 3306
+    user = unquote(u.username or "") if u.username else None
+    pwd = unquote(u.password or "") if u.password else None
+    db = (u.path or "").lstrip("/")
+    db = unquote(db) if db else None
+
+    if not host or not user or not db:
+        return None
+
+    return (host, port, user, pwd, db)
+
 
 
 def _db_params():
+    # 1) Intentamos con DATABASE_URL / MYSQL_URL
     if DATABASE_URL:
         parsed = _parse_db_url(DATABASE_URL)
-        if not parsed:
-            return {}
-        h, p, u, pwd, db = parsed
-        return {"host": h, "port": p, "user": u, "password": pwd, "database": db}
+        if parsed:
+            h, p, u, pwd, db = parsed
+            return {"host": h, "port": p, "user": u, "password": pwd, "database": db}
 
+    # 2) Fallback a variables sueltas (Railway MySQL service)
     return {
         "host": MYSQL_HOST,
         "port": MYSQL_PORT,
@@ -139,6 +157,7 @@ def _db_params():
         "password": MYSQL_PASSWORD,
         "database": MYSQL_DB,
     }
+
 
 
 def _safe_connect():
@@ -232,27 +251,54 @@ def search_db_by_address(raw_text: str) -> Optional[dict]:
     conn = _safe_connect()
     if not conn:
         return None
+
+    q = (raw_text or "").strip()
+    if not q:
+        return None
+
     try:
-        pats = _build_like_patterns(raw_text)
+        with conn.cursor() as cur:
+            # 1) Match exacto (TU CASO: "Garita 9")
+            try:
+                cur.execute(
+                    f"""
+                    SELECT id, direccion, zona, tipo_propiedad, ambientes, dormitorios, cochera,
+                           precio_venta, precio_alquiler, total_construido, superficie, expensas
+                    FROM `{MYSQL_TABLE}`
+                    WHERE TRIM(direccion) = TRIM(%s)
+                    LIMIT 1
+                    """,
+                    (q,),
+                )
+                row_exact = cur.fetchone()
+                if row_exact:
+                    return row_exact
+            except Exception:
+                pass
+
+        # 2) Fallback LIKE + ranking
+        pats = _build_like_patterns(q)
         cands = _fetch_candidates_from_table(conn, MYSQL_TABLE, pats)
         if not cands and MYSQL_TABLE != "propiedad":
             cands = _fetch_candidates_from_table(conn, "propiedad", pats)
         if not cands:
             return None
 
-        qn = _strip_accents(raw_text)
+        qn = _strip_accents(q)
         best, best_score = None, 0.0
         for r in cands:
             addr = _strip_accents(_s(r.get("direccion")))
             score = SequenceMatcher(None, qn, addr).ratio()
             if score > best_score:
                 best, best_score = r, score
+
         return best if best_score >= 0.55 else None
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
 
 
 def search_db_by_id(pid: int) -> Optional[dict]:
