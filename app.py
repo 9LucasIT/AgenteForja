@@ -721,6 +721,7 @@ def _no_has_link_or_address(t: str) -> bool:
     nt = _strip_accents(t)
     if nt in {"no", "nop", "nah", "negativo"}:
         return True
+
     patterns = [
         r"\bno tengo\b",
         r"\bno tengo la direccion\b",
@@ -735,6 +736,7 @@ def _no_has_link_or_address(t: str) -> bool:
         r"\bsin link\b",
     ]
     return any(re.search(p, nt) for p in patterns)
+
 
 
 
