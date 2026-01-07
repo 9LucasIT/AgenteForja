@@ -961,75 +961,85 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             return QualifyOut(reply_text=cierre, vendor_push=True, vendor_message=resumen, closing_text="")
 
         if stage == "ask_zone_or_address":
-            
-            if _no_has_link_or_address(text) or _is_zone_search(text):
-                s["stage"] = "done"
-                return QualifyOut(
-                    reply_text=(
-                        "No hay drama 😊\n"
-                        "Te dejo nuestra web para que veas todas las propiedades disponibles y, si alguna te interesa, "
-                        "me mandás el link por acá y te ayudo enseguida:\n"
-                        f"{SITE_URL}\n\n"
-                        "¡Quedo atento!"
-                    ),
-                    vendor_push=False,
-                    vendor_message="",
-                    closing_text=_farewell(),
-                )
 
-            urls_zone = _extract_urls(text)
-            if urls_zone:
-                s["last_link"] = urls_zone[0]
+    # ✅ INTERCEPTAR RESPUESTA NEGATIVA PRIMERO (ANTES DE BUSCAR)
+    if _no_has_link_or_address(text):
+        s["stage"] = "done"
+        return QualifyOut(
+            reply_text=(
+                "No hay problema 😊\n"
+                "Te dejo nuestra web para que veas todas las propiedades disponibles. "
+                "Si alguna te interesa, mandame el link por acá y te ayudo enseguida 👌\n\n"
+                f"{SITE_URL}"
+            ),
+            vendor_push=False,
+            vendor_message="",
+            closing_text=_farewell(),
+        )
 
-            row_link = _try_property_from_link_or_slug(text)
-            if row_link:
-                intent_infer = _infer_intent_from_row(row_link) or s.get("intent") or "venta"
-                s["prop_row"] = row_link
-                s["intent"] = intent_infer
-                brief = render_property_card_db(row_link, intent=intent_infer)
-                s["prop_brief"] = brief
-                s["stage"] = "show_property_asked_qualify"
+    # ================================
+    # A PARTIR DE ACÁ, FLUJO NORMAL
+    # ================================
 
-                if intent_infer == "alquiler":
-                    s["last_prompt"] = "qual_disp_alq"
-                    return QualifyOut(reply_text=brief + "\n\n" + _ask_disponibilidad())
-                else:
-                    s["last_prompt"] = "qual_disp_venta"
-                    return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt("venta"))
+    urls_zone = _extract_urls(text)
+    if urls_zone:
+        s["last_link"] = urls_zone[0]
 
-            if urls_zone:
-                s["stage"] = "ask_link_disp"
-                intent2 = s.get("intent", "alquiler")
-                if intent2 == "venta":
-                    s["last_prompt"] = "qual_disp_venta_link"
-                    return QualifyOut(reply_text=_ask_qualify_prompt("venta"))
-                else:
-                    s["last_prompt"] = "qual_disp_alq_link"
-                    return QualifyOut(reply_text=_ask_disponibilidad())
+    # 1) Intentar detectar ficha por link o slug
+    row_link = _try_property_from_link_or_slug(text)
+    if row_link:
+        intent_infer = _infer_intent_from_row(row_link) or s.get("intent") or "venta"
+        s["prop_row"] = row_link
+        s["intent"] = intent_infer
+        brief = render_property_card_db(row_link, intent=intent_infer)
+        s["prop_brief"] = brief
+        s["stage"] = "show_property_asked_qualify"
 
-            intent = s.get("intent", "alquiler")
-            row = search_db_by_address(text)
+        if intent_infer == "alquiler":
+            s["last_prompt"] = "qual_disp_alq"
+            return QualifyOut(reply_text=brief + "\n\n" + _ask_disponibilidad())
+        else:
+            s["last_prompt"] = "qual_disp_venta"
+            return QualifyOut(reply_text=brief + "\n\n" + _ask_qualify_prompt("venta"))
 
-            if row:
-                intent_infer2 = _infer_intent_from_row(row) or intent
-                brief2 = render_property_card_db(row, intent=intent_infer2)
-                s["prop_row"] = row
-                s["prop_brief"] = brief2
-                s["intent"] = intent_infer2
-                s["stage"] = "show_property_asked_qualify"
-                if s["intent"] == "alquiler":
-                    s["last_prompt"] = "qual_disp_alq"
-                    return QualifyOut(reply_text=brief2 + "\n\n" + _ask_disponibilidad())
-                else:
-                    s["last_prompt"] = "qual_disp_venta"
-                    return QualifyOut(reply_text=brief2 + "\n\n" + _ask_qualify_prompt("venta"))
+    # 2) Si hay link pero no ficha → pasar a disponibilidad
+    if urls_zone:
+        s["stage"] = "ask_link_disp"
+        intent2 = s.get("intent", "alquiler")
+        if intent2 == "venta":
+            s["last_prompt"] = "qual_disp_venta_link"
+            return QualifyOut(reply_text=_ask_qualify_prompt("venta"))
+        else:
+            s["last_prompt"] = "qual_disp_alq_link"
+            return QualifyOut(reply_text=_ask_disponibilidad())
 
-            return QualifyOut(
-                reply_text=(
-                    "No pude identificar la ficha. "
-                    "¿Podés confirmarme la *dirección exacta* tal como figura en la publicación?"
-                )
-            )
+    # 3) Buscar por dirección escrita
+    intent = s.get("intent", "alquiler")
+    row = search_db_by_address(text)
+
+    if row:
+        intent_infer2 = _infer_intent_from_row(row) or intent
+        brief2 = render_property_card_db(row, intent=intent_infer2)
+        s["prop_row"] = row
+        s["prop_brief"] = brief2
+        s["intent"] = intent_infer2
+        s["stage"] = "show_property_asked_qualify"
+
+        if s["intent"] == "alquiler":
+            s["last_prompt"] = "qual_disp_alq"
+            return QualifyOut(reply_text=brief2 + "\n\n" + _ask_disponibilidad())
+        else:
+            s["last_prompt"] = "qual_disp_venta"
+            return QualifyOut(reply_text=brief2 + "\n\n" + _ask_qualify_prompt("venta"))
+
+    # 4) Último fallback (solo si NO dijo que no)
+    return QualifyOut(
+        reply_text=(
+            "No pude identificar la ficha. "
+            "¿Podés confirmarme la *dirección exacta* tal como figura en la publicación?"
+        )
+    )
+
 
         if stage == "ask_link_disp":
             intent = s.get("intent", "alquiler")
