@@ -717,6 +717,26 @@ def _is_valuation_intent(t: str) -> bool:
     return any(k in t for k in keys) or t.strip() in {"3", "3-", "3 -"}
 
 
+def _no_has_link_or_address(t: str) -> bool:
+    nt = _strip_accents(t)
+    if nt in {"no", "nop", "nah", "negativo"}:
+        return True
+    patterns = [
+        r"\bno tengo\b",
+        r"\bno tengo la direccion\b",
+        r"\bno tengo direccion\b",
+        r"\bno tengo el link\b",
+        r"\bno tengo link\b",
+        r"\bno cuento con\b",
+        r"\bno se\b",
+        r"\bno lo tengo\b",
+        r"\bsin direccion\b",
+        r"\bsin dirección\b",
+        r"\bsin link\b",
+    ]
+    return any(re.search(p, nt) for p in patterns)
+
+
 
 def _is_zone_search(t: str) -> bool:
     nt = _strip_accents(t)
@@ -941,6 +961,22 @@ async def qualify(body: QualifyIn) -> QualifyOut:
             return QualifyOut(reply_text=cierre, vendor_push=True, vendor_message=resumen, closing_text="")
 
         if stage == "ask_zone_or_address":
+            
+            if _no_has_link_or_address(text) or _is_zone_search(text):
+                s["stage"] = "done"
+                return QualifyOut(
+                    reply_text=(
+                        "No hay drama 😊\n"
+                        "Te dejo nuestra web para que veas todas las propiedades disponibles y, si alguna te interesa, "
+                        "me mandás el link por acá y te ayudo enseguida:\n"
+                        f"{SITE_URL}\n\n"
+                        "¡Quedo atento!"
+                    ),
+                    vendor_push=False,
+                    vendor_message="",
+                    closing_text=_farewell(),
+                )
+
             urls_zone = _extract_urls(text)
             if urls_zone:
                 s["last_link"] = urls_zone[0]
