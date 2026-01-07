@@ -739,7 +739,6 @@ def _no_has_link_or_address(t: str) -> bool:
 
 
 
-
 def _is_zone_search(t: str) -> bool:
     nt = _strip_accents(t)
     patterns = [
@@ -964,20 +963,20 @@ async def qualify(body: QualifyIn) -> QualifyOut:
 
         if stage == "ask_zone_or_address":
 
-    # ✅ INTERCEPTAR RESPUESTA NEGATIVA PRIMERO (ANTES DE BUSCAR)
-    if _no_has_link_or_address(text):
-        s["stage"] = "done"
-        return QualifyOut(
-            reply_text=(
-                "No hay problema 😊\n"
-                "Te dejo nuestra web para que veas todas las propiedades disponibles. "
-                "Si alguna te interesa, mandame el link por acá y te ayudo enseguida 👌\n\n"
-                f"{SITE_URL}"
-            ),
-            vendor_push=False,
-            vendor_message="",
-            closing_text=_farewell(),
-        )
+            # ✅ INTERCEPTAR RESPUESTA NEGATIVA PRIMERO (ANTES DE BUSCAR)
+            if _no_has_link_or_address(text):
+                s["stage"] = "done"
+                return QualifyOut(
+                    reply_text=(
+                        "No hay problema 😊\n"
+                        "Te dejo nuestra web para que veas todas las propiedades disponibles. "
+                        "Si alguna te interesa, mandame el link por acá y te ayudo enseguida 👌\n\n"
+                        f"{SITE_URL}"
+                    ),
+                    vendor_push=False,
+                    vendor_message="",
+                    closing_text=_farewell(),
+                )
 
     # ================================
     # A PARTIR DE ACÁ, FLUJO NORMAL
