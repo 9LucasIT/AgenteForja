@@ -791,192 +791,192 @@ def _ensure_session(chat_id: str):
 
 
 @app.post("/qualify", response_model=QualifyOut)
-async def qualify(body: QualifyIn) -> QualifyOut:
-    chat_id = (body.chatId or "").strip()
-    text = (body.message or "").strip()
-
-    # FIX n8n: si llega un request sin chatId, lo ignoramos sin error
-    if not chat_id:
-        return QualifyOut(reply_text="", vendor_push=False, vendor_message="", closing_text="")
-
-    # si viene de mi mismo, no respondemos (evita loops)
-    if body.isFromMe:
-        return QualifyOut(reply_text="", vendor_push=False, vendor_message="", closing_text="")
-
-    try:
-        _ensure_session(chat_id)
-        s = STATE[chat_id]
-
-        # reset siempre tiene prioridad, incluso si el chat está en "done"
-        if _wants_reset(text):
-            _reset(chat_id)
-            return QualifyOut(reply_text=_say_menu())
-
-        stage = s.get("stage", "menu")
-
-        # si ya estaba finalizado, le mostramos menú (así nunca queda "muerto")
-        if stage == "done":
-            s["stage"] = "menu"
-            return QualifyOut(reply_text=_say_menu())
-
-        # ======= TODO TU FLUJO EXISTENTE, SIN CAMBIOS =======
-
-        if stage == "menu":
-            urls = _extract_urls(text)
-            if urls:
-                s["last_link"] = urls[0]
-
-                row_link = _try_property_from_link_or_slug(text)
-                if row_link:
-                    intent = _infer_intent_from_row(row_link) or "venta"
-                    s["intent"] = intent
-                    s["prop_row"] = row_link
-                    brief = render_property_card_db(row_link, intent=intent)
-                    s["prop_brief"] = brief
-                    s["stage"] = "show_property_asked_qualify"
-
-                    if intent == "alquiler":
-                        s["last_prompt"] = "qual_disp_alq"
-                        return QualifyOut(reply_text=brief + "\n\n" + _ask_disponibilidad())
-                    else:
-                        s["last_prompt"] = "qual_disp_venta"
-                        return QualifyOut(reply_text=brief + "\n\n" + _ask_disponibilidad())
-
-                s["intent"] = "alquiler"
-                s["stage"] = "ask_link_disp"
-                s["last_prompt"] = "qual_disp_alq_link"
-                return QualifyOut(reply_text=_ask_disponibilidad())
-
-            if not text:
+    async def qualify(body: QualifyIn) -> QualifyOut:
+        chat_id = (body.chatId or "").strip()
+        text = (body.message or "").strip()
+    
+        # FIX n8n: si llega un request sin chatId, lo ignoramos sin error
+        if not chat_id:
+            return QualifyOut(reply_text="", vendor_push=False, vendor_message="", closing_text="")
+    
+        # si viene de mi mismo, no respondemos (evita loops)
+        if body.isFromMe:
+            return QualifyOut(reply_text="", vendor_push=False, vendor_message="", closing_text="")
+    
+        try:
+            _ensure_session(chat_id)
+            s = STATE[chat_id]
+    
+            # reset siempre tiene prioridad, incluso si el chat está en "done"
+            if _wants_reset(text):
+                _reset(chat_id)
                 return QualifyOut(reply_text=_say_menu())
-
-            if _is_rental_intent(text):
-                s["intent"] = "alquiler"
-                s["stage"] = "ask_zone_or_address"
-                return QualifyOut(reply_text=_ask_zone_or_address())
-
-            if _is_sale_intent(text):
-                s["intent"] = "venta"
-                s["stage"] = "ask_zone_or_address"
-                return QualifyOut(reply_text=_ask_zone_or_address())
-
-            if _is_valuation_intent(text):
-                s["intent"] = "tasacion"
-                s["stage"] = "tas_op"
-                s["tas_op"] = None
-                s["tas_prop"] = None
-                s["tas_m2"] = None
-                s["tas_dir"] = None
-                s["tas_exp"] = None
-                s["tas_feat"] = None
-                s["tas_disp"] = None
+    
+            stage = s.get("stage", "menu")
+    
+            # si ya estaba finalizado, le mostramos menú (así nunca queda "muerto")
+            if stage == "done":
+                s["stage"] = "menu"
+                return QualifyOut(reply_text=_say_menu())
+    
+            # ======= TODO TU FLUJO EXISTENTE, SIN CAMBIOS =======
+    
+            if stage == "menu":
+                urls = _extract_urls(text)
+                if urls:
+                    s["last_link"] = urls[0]
+    
+                    row_link = _try_property_from_link_or_slug(text)
+                    if row_link:
+                        intent = _infer_intent_from_row(row_link) or "venta"
+                        s["intent"] = intent
+                        s["prop_row"] = row_link
+                        brief = render_property_card_db(row_link, intent=intent)
+                        s["prop_brief"] = brief
+                        s["stage"] = "show_property_asked_qualify"
+    
+                        if intent == "alquiler":
+                            s["last_prompt"] = "qual_disp_alq"
+                            return QualifyOut(reply_text=brief + "\n\n" + _ask_disponibilidad())
+                        else:
+                            s["last_prompt"] = "qual_disp_venta"
+                            return QualifyOut(reply_text=brief + "\n\n" + _ask_disponibilidad())
+    
+                    s["intent"] = "alquiler"
+                    s["stage"] = "ask_link_disp"
+                    s["last_prompt"] = "qual_disp_alq_link"
+                    return QualifyOut(reply_text=_ask_disponibilidad())
+    
+                if not text:
+                    return QualifyOut(reply_text=_say_menu())
+    
+                if _is_rental_intent(text):
+                    s["intent"] = "alquiler"
+                    s["stage"] = "ask_zone_or_address"
+                    return QualifyOut(reply_text=_ask_zone_or_address())
+    
+                if _is_sale_intent(text):
+                    s["intent"] = "venta"
+                    s["stage"] = "ask_zone_or_address"
+                    return QualifyOut(reply_text=_ask_zone_or_address())
+    
+                if _is_valuation_intent(text):
+                    s["intent"] = "tasacion"
+                    s["stage"] = "tas_op"
+                    s["tas_op"] = None
+                    s["tas_prop"] = None
+                    s["tas_m2"] = None
+                    s["tas_dir"] = None
+                    s["tas_exp"] = None
+                    s["tas_feat"] = None
+                    s["tas_disp"] = None
+                    return QualifyOut(
+                        reply_text="¡Genial! Para la *tasación*, contame el *tipo de operación*: ¿venta o alquiler?"
+                    )
+    
+                return QualifyOut(reply_text=_say_menu())
+    
+            if stage == "tas_op":
+                t = _strip_accents(text)
+                if "venta" in t:
+                    s["tas_op"] = "venta"
+                elif "alquiler" in t or "renta" in t or "alquilar" in t:
+                    s["tas_op"] = "alquiler"
+                else:
+                    return QualifyOut(reply_text="¿Me confirmás el *tipo de operación*? (venta o alquiler)")
+                s["stage"] = "tas_prop"
                 return QualifyOut(
-                    reply_text="¡Genial! Para la *tasación*, contame el *tipo de operación*: ¿venta o alquiler?"
+                    reply_text="Perfecto. Comentame ahora, ¿cuál es el *tipo de propiedad*? (ej.: departamento, casa, local, oficina)"
                 )
-
-            return QualifyOut(reply_text=_say_menu())
-
-        if stage == "tas_op":
-            t = _strip_accents(text)
-            if "venta" in t:
-                s["tas_op"] = "venta"
-            elif "alquiler" in t or "renta" in t or "alquilar" in t:
-                s["tas_op"] = "alquiler"
-            else:
-                return QualifyOut(reply_text="¿Me confirmás el *tipo de operación*? (venta o alquiler)")
-            s["stage"] = "tas_prop"
-            return QualifyOut(
-                reply_text="Perfecto. Comentame ahora, ¿cuál es el *tipo de propiedad*? (ej.: departamento, casa, local, oficina)"
-            )
-
-        if stage == "tas_prop":
-            s["tas_prop"] = text.strip() or "no informado"
-            s["stage"] = "tas_m2"
-            return QualifyOut(reply_text="Muchisimas gracias 😊. ¿Cuántos *metros cuadrados* aproximados tiene la propiedad?")
-
-        if stage == "tas_m2":
-            n = _num_from_text(text)
-            if n is None:
-                return QualifyOut(reply_text="¿Me pasás un *número* aproximado de metros cuadrados? (ej.: 65)")
-            s["tas_m2"] = n
-            s["stage"] = "tas_dir"
-            return QualifyOut(
-                reply_text="Anotado 👍. ¿Cuál es la *dirección exacta* del inmueble? (calle y número; si podés, piso/depto)"
-            )
-
-        if stage == "tas_dir":
-            if not _has_addr_number_strict(text):
-                return QualifyOut(reply_text="¿Podés pasarme *calle y número*? Si tenés piso/depto, mejor.")
-            s["tas_dir"] = text.strip()
-            s["stage"] = "tas_exp"
-            return QualifyOut(
-                reply_text="¿La propiedad tiene *expensas*? Si tiene, ¿de cuánto es el *costo mensual* (ARS)? Si no, decime *no tiene*."
-            )
-
-        if stage == "tas_exp":
-            t = _strip_accents(text)
-            if any(x in t for x in ("no tiene", "sin expensas", "no")):
-                s["tas_exp"] = "no tiene"
-            else:
-                val = _money_from_text(text)
-                s["tas_exp"] = f"${val:,}".replace(",", ".") if val else (text.strip() or "no informado")
-            s["stage"] = "tas_feat"
-            return QualifyOut(
-                reply_text="Contame, ¿dispone *balcón, patio, amenities o estudio de factibilidad*? Podés responder con una lista (ej.: “balcón y amenities”) o “no”."
-            )
-
-        if stage == "tas_feat":
-            t = _strip_accents(text)
-            feats = []
-            if "balcon" in t or "balcón" in text.lower():
-                feats.append("balcón")
-            if "patio" in t:
-                feats.append("patio")
-            if "amenities" in t:
-                feats.append("amenities")
-            if "estudio" in t or "factibilidad" in t:
-                feats.append("estudio factibilidad")
-            if t in {"no", "ninguno", "ninguna", "ningunos"}:
+    
+            if stage == "tas_prop":
+                s["tas_prop"] = text.strip() or "no informado"
+                s["stage"] = "tas_m2"
+                return QualifyOut(reply_text="Muchisimas gracias 😊. ¿Cuántos *metros cuadrados* aproximados tiene la propiedad?")
+    
+            if stage == "tas_m2":
+                n = _num_from_text(text)
+                if n is None:
+                    return QualifyOut(reply_text="¿Me pasás un *número* aproximado de metros cuadrados? (ej.: 65)")
+                s["tas_m2"] = n
+                s["stage"] = "tas_dir"
+                return QualifyOut(
+                    reply_text="Anotado 👍. ¿Cuál es la *dirección exacta* del inmueble? (calle y número; si podés, piso/depto)"
+                )
+    
+            if stage == "tas_dir":
+                if not _has_addr_number_strict(text):
+                    return QualifyOut(reply_text="¿Podés pasarme *calle y número*? Si tenés piso/depto, mejor.")
+                s["tas_dir"] = text.strip()
+                s["stage"] = "tas_exp"
+                return QualifyOut(
+                    reply_text="¿La propiedad tiene *expensas*? Si tiene, ¿de cuánto es el *costo mensual* (ARS)? Si no, decime *no tiene*."
+                )
+    
+            if stage == "tas_exp":
+                t = _strip_accents(text)
+                if any(x in t for x in ("no tiene", "sin expensas", "no")):
+                    s["tas_exp"] = "no tiene"
+                else:
+                    val = _money_from_text(text)
+                    s["tas_exp"] = f"${val:,}".replace(",", ".") if val else (text.strip() or "no informado")
+                s["stage"] = "tas_feat"
+                return QualifyOut(
+                    reply_text="Contame, ¿dispone *balcón, patio, amenities o estudio de factibilidad*? Podés responder con una lista (ej.: “balcón y amenities”) o “no”."
+                )
+    
+            if stage == "tas_feat":
+                t = _strip_accents(text)
                 feats = []
-            s["tas_feat"] = ", ".join(feats) if feats else "no"
-            s["stage"] = "tas_disp"
-            return QualifyOut(
-                reply_text="¡Último dato! Decime es tu *disponibilidad horaria* aproximada para que te contacte un asesor"
-            )
-
-        if stage == "tas_disp":
-            s["tas_disp"] = text.strip() or "no informado"
-            s["stage"] = "done"
-            resumen = (
-                "Tasación solicitada ✅\n"
-                f"• Operación: {s.get('tas_op','N/D')}\n"
-                f"• Propiedad: {s.get('tas_prop','N/D')}\n"
-                f"• Metros²: {s.get('tas_m2','N/D')}\n"
-                f"• Dirección: {s.get('tas_dir','N/D')}\n"
-                f"• Expensas: {s.get('tas_exp','N/D')}\n"
-                f"• Extras: {s.get('tas_feat','N/D')}\n"
-                f"• Disponibilidad: {s.get('tas_disp','N/D')}\n"
-                f"• Chat: {chat_id}"
-            )
-            cierre = "Perfecto, con todos estos datos ya cuento con lo suficiente para derivarte con un asesor, muchisimas gracias por tu tiempo!"
-            return QualifyOut(reply_text=cierre, vendor_push=True, vendor_message=resumen, closing_text="")
-
-        if stage == "ask_zone_or_address":
-
-            # ✅ INTERCEPTAR RESPUESTA NEGATIVA PRIMERO (ANTES DE BUSCAR)
-            if _no_has_link_or_address(text):
-                s["stage"] = "done"
+                if "balcon" in t or "balcón" in text.lower():
+                    feats.append("balcón")
+                if "patio" in t:
+                    feats.append("patio")
+                if "amenities" in t:
+                    feats.append("amenities")
+                if "estudio" in t or "factibilidad" in t:
+                    feats.append("estudio factibilidad")
+                if t in {"no", "ninguno", "ninguna", "ningunos"}:
+                    feats = []
+                s["tas_feat"] = ", ".join(feats) if feats else "no"
+                s["stage"] = "tas_disp"
                 return QualifyOut(
-                    reply_text=(
-                        "No hay problema 😊\n"
-                        "Te dejo nuestra web para que veas todas las propiedades disponibles. "
-                        "Si alguna te interesa, mandame el link por acá y te ayudo enseguida 👌\n\n"
-                        f"{SITE_URL}"
-                    ),
-                    vendor_push=False,
-                    vendor_message="",
-                    closing_text=_farewell(),
+                    reply_text="¡Último dato! Decime es tu *disponibilidad horaria* aproximada para que te contacte un asesor"
                 )
+    
+            if stage == "tas_disp":
+                s["tas_disp"] = text.strip() or "no informado"
+                s["stage"] = "done"
+                resumen = (
+                    "Tasación solicitada ✅\n"
+                    f"• Operación: {s.get('tas_op','N/D')}\n"
+                    f"• Propiedad: {s.get('tas_prop','N/D')}\n"
+                    f"• Metros²: {s.get('tas_m2','N/D')}\n"
+                    f"• Dirección: {s.get('tas_dir','N/D')}\n"
+                    f"• Expensas: {s.get('tas_exp','N/D')}\n"
+                    f"• Extras: {s.get('tas_feat','N/D')}\n"
+                    f"• Disponibilidad: {s.get('tas_disp','N/D')}\n"
+                    f"• Chat: {chat_id}"
+                )
+                cierre = "Perfecto, con todos estos datos ya cuento con lo suficiente para derivarte con un asesor, muchisimas gracias por tu tiempo!"
+                return QualifyOut(reply_text=cierre, vendor_push=True, vendor_message=resumen, closing_text="")
+    
+            if stage == "ask_zone_or_address":
+    
+                # ✅ INTERCEPTAR RESPUESTA NEGATIVA PRIMERO (ANTES DE BUSCAR)
+                if _no_has_link_or_address(text):
+                    s["stage"] = "done"
+                    return QualifyOut(
+                        reply_text=(
+                            "No hay problema 😊\n"
+                            "Te dejo nuestra web para que veas todas las propiedades disponibles. "
+                            "Si alguna te interesa, mandame el link por acá y te ayudo enseguida 👌\n\n"
+                            f"{SITE_URL}"
+                        ),
+                        vendor_push=False,
+                        vendor_message="",
+                        closing_text=_farewell(),
+                    )
 
     # ================================
     # A PARTIR DE ACÁ, FLUJO NORMAL
