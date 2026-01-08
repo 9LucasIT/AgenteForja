@@ -72,9 +72,10 @@ def _ask_zone_or_address() -> str:
 
 
 def _ask_disponibilidad() -> str:
-    return "¿Esta propiedad se ajusta a lo que estás buscando? 👀\n"
-            "Si querés avanzar, decime tu disponibilidad conocer la propiedad y un asesor se contacta con vos para coordinar la visita."
-
+    return (
+        "¿Esta propiedad se ajusta a lo que estás buscando? 👀\n\n" 
+        "Si querés avanzar, decime tu disponibilidad conocer la propiedad y un asesor se contacta con vos para coordinar la visita."
+    )
 
 def _ask_qualify_prompt(intent: str) -> str:
     if intent == "alquiler":
